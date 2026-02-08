@@ -1,0 +1,68 @@
+# Baseline Classification Experiment Configuration
+# This config runs FP32 inference on ImageNet-1K validation set
+
+experiment:
+  name: "baseline_classification"
+  description: "Baseline FP32 inference on ImageNet-1K for classification models"
+  seed: 42
+  device: "cuda"  # "cuda" or "cpu"
+  num_workers: 8
+  debug: false  # If true, uses subset of data for quick testing
+  debug_samples: 100  # Number of samples to use in debug mode
+
+models:
+  - name: "resnet50"
+    architecture: "resnet50"
+    weights: "IMAGENET1K_V2"
+    task: "classification"
+    num_classes: 1000
+  
+  - name: "mobilenetv2"
+    architecture: "mobilenet_v2"
+    weights: "IMAGENET1K_V1"
+    task: "classification"
+    num_classes: 1000
+  
+  - name: "vit_base"
+    architecture: "vit_b_16"
+    weights: "IMAGENET1K_V1"
+    task: "classification"
+    num_classes: 1000
+
+datasets:
+  imagenet:
+    name: "imagenet"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet/validation"
+    split: "val"
+    batch_size: 64
+    shuffle: false
+    num_workers: 8
+    pin_memory: true
+
+quantization:
+  enabled: false  # Week 1: FP32 baseline only
+  precision: ["int8"]  # Options: int8, int4, int2
+  calibration:
+    method: "minmax"  # Options: minmax, percentile, entropy
+    num_samples: 1000
+    percentile: 99.99  # Used when method is "percentile"
+
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_to_file: true
+  log_dir: "./logs"
+  
+  wandb:
+    enabled: true
+    project: "quantization-analysis"
+    entity: null  # Set to your wandb entity or leave null for default
+    tags: ["baseline", "fp32", "classification"]
+    notes: "Week 1: Baseline FP32 inference on ImageNet-1K"
+
+output:
+  save_predictions: true
+  prediction_format: "pickle"  # Options: pickle, json, hdf5
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  save_logits: true  # Save raw logits for later analysis
+  save_confidence: true  # Save prediction confidence scores
