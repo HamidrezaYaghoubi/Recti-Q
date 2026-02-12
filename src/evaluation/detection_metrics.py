@@ -18,6 +18,7 @@ def compute_coco_metrics(
     targets: List[Dict[str, Any]],
     coco_gt,
     iou_types: List[str] = ["bbox"],
+    verbose: bool = False,
 ) -> Dict[str, float]:
     """
     Compute COCO evaluation metrics using pycocotools.
@@ -27,10 +28,13 @@ def compute_coco_metrics(
         targets: List of target dicts with 'image_id'.
         coco_gt: COCO ground truth object from pycocotools.
         iou_types: Types of IoU evaluation (default: ["bbox"]).
+        verbose: Whether to print pycocotools output (default: False).
         
     Returns:
         Dictionary with COCO metrics (mAP, mAP50, mAP75, etc.).
     """
+    import sys
+    import io
     from pycocotools.cocoeval import COCOeval
     
     # Convert predictions to COCO format
@@ -85,36 +89,46 @@ def compute_coco_metrics(
             "AR_large": 0.0,
         }
     
-    # Load results into COCO format
-    coco_dt = coco_gt.loadRes(coco_results)
+    # Suppress pycocotools verbose output unless requested
+    if not verbose:
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
     
-    # Run evaluation
-    metrics = {}
-    
-    for iou_type in iou_types:
-        coco_eval = COCOeval(coco_gt, coco_dt, iou_type)
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
+    try:
+        # Load results into COCO format
+        coco_dt = coco_gt.loadRes(coco_results)
         
-        # Extract metrics
-        # stats order: [AP, AP50, AP75, AP_s, AP_m, AP_l, AR1, AR10, AR100, AR_s, AR_m, AR_l]
-        stats = coco_eval.stats
+        # Run evaluation
+        metrics = {}
         
-        metrics.update({
-            "mAP": float(stats[0]) * 100,        # AP @ IoU=0.50:0.95
-            "mAP50": float(stats[1]) * 100,      # AP @ IoU=0.50
-            "mAP75": float(stats[2]) * 100,      # AP @ IoU=0.75
-            "mAP_small": float(stats[3]) * 100,  # AP for small objects
-            "mAP_medium": float(stats[4]) * 100, # AP for medium objects
-            "mAP_large": float(stats[5]) * 100,  # AP for large objects
-            "AR_1": float(stats[6]) * 100,       # AR given 1 detection per image
-            "AR_10": float(stats[7]) * 100,      # AR given 10 detections per image
-            "AR_100": float(stats[8]) * 100,     # AR given 100 detections per image
-            "AR_small": float(stats[9]) * 100,   # AR for small objects
-            "AR_medium": float(stats[10]) * 100, # AR for medium objects
-            "AR_large": float(stats[11]) * 100,  # AR for large objects
-        })
+        for iou_type in iou_types:
+            coco_eval = COCOeval(coco_gt, coco_dt, iou_type)
+            coco_eval.evaluate()
+            coco_eval.accumulate()
+            coco_eval.summarize()
+        
+            # Extract metrics
+            # stats order: [AP, AP50, AP75, AP_s, AP_m, AP_l, AR1, AR10, AR100, AR_s, AR_m, AR_l]
+            stats = coco_eval.stats
+            
+            metrics.update({
+                "mAP": float(stats[0]) * 100,        # AP @ IoU=0.50:0.95
+                "mAP50": float(stats[1]) * 100,      # AP @ IoU=0.50
+                "mAP75": float(stats[2]) * 100,      # AP @ IoU=0.75
+                "mAP_small": float(stats[3]) * 100,  # AP for small objects
+                "mAP_medium": float(stats[4]) * 100, # AP for medium objects
+                "mAP_large": float(stats[5]) * 100,  # AP for large objects
+                "AR_1": float(stats[6]) * 100,       # AR given 1 detection per image
+                "AR_10": float(stats[7]) * 100,      # AR given 10 detections per image
+                "AR_100": float(stats[8]) * 100,     # AR given 100 detections per image
+                "AR_small": float(stats[9]) * 100,   # AR for small objects
+                "AR_medium": float(stats[10]) * 100, # AR for medium objects
+                "AR_large": float(stats[11]) * 100,  # AR for large objects
+            })
+    finally:
+        # Restore stdout
+        if not verbose:
+            sys.stdout = old_stdout
     
     return metrics
 

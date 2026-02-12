@@ -16,7 +16,7 @@ import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -29,9 +29,19 @@ sys.path.insert(0, str(project_root))
 from src.utils.config import load_config, ExperimentConfig, ModelConfig
 from src.utils.logging import setup_logging, get_logger, WandbLogger, MetricsLogger
 from src.utils.checkpoint import CheckpointManager
+from src.utils.formatting import (
+    format_classification_results,
+    format_detection_results,
+    format_experiment_header,
+    format_model_header,
+    format_final_summary,
+    format_quantization_stats,
+    format_comparison_row,
+)
 from src.models import ModelFactory, BaseModel
 from src.datasets import get_imagenet_loader, get_imagenet_c_loader, get_all_imagenet_c_loaders
 from src.evaluation import MetricsComputer, ClassificationMetrics
+from src.quantization import quantize_model, QUANT_MODES
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,7 +217,7 @@ def evaluate_model_on_imagenet(
     Returns:
         Classification metrics.
     """
-    text_logger.info(f"Evaluating {model.name} on ImageNet...")
+    text_logger.info(f"  Evaluating on ImageNet...")
     
     # Get dataset config
     dataset_config = config.get_dataset("imagenet")
@@ -237,7 +247,14 @@ def evaluate_model_on_imagenet(
         f"{model.name}/imagenet/top5": metrics.top5_accuracy,
     })
     
-    text_logger.info(f"Results: {metrics}")
+    # Print formatted results
+    formatted = format_classification_results(
+        model_name=model.name,
+        dataset_name="ImageNet",
+        metrics=metrics,
+        precision="fp32",
+    )
+    print("\n" + formatted)
     
     # Save predictions
     if config.output.save_predictions:
@@ -288,7 +305,7 @@ def evaluate_model_on_imagenet_c(
     Returns:
         Dictionary mapping (corruption, severity) to metrics.
     """
-    text_logger.info(f"Evaluating {model.name} on ImageNet-C...")
+    text_logger.info(f"  Evaluating on ImageNet-C...")
     
     # Get dataset config
     dataset_config = config.get_dataset("imagenet_c")
@@ -303,8 +320,6 @@ def evaluate_model_on_imagenet_c(
     all_metrics = {}
     
     for (corruption, severity), dataloader in loaders.items():
-        text_logger.info(f"  Corruption: {corruption}, Severity: {severity}")
-        
         # Optionally limit samples in debug mode
         if config.debug:
             from src.datasets.base import SubsetDataset
@@ -321,7 +336,7 @@ def evaluate_model_on_imagenet_c(
             dataloader=dataloader,
             device=config.device,
             logger=logger,
-            description=f"ImageNet-C {corruption}/{severity}",
+            description=f"ImageNet-C {corruption}/s{severity}",
         )
         
         metrics = results["metrics"]
@@ -332,8 +347,6 @@ def evaluate_model_on_imagenet_c(
             f"{model.name}/imagenet_c/{corruption}/s{severity}/top1": metrics.top1_accuracy,
             f"{model.name}/imagenet_c/{corruption}/s{severity}/top5": metrics.top5_accuracy,
         })
-        
-        text_logger.info(f"    Results: {metrics}")
         
         # Save predictions
         if config.output.save_predictions:
@@ -357,7 +370,15 @@ def evaluate_model_on_imagenet_c(
     mean_top1 = sum(m.top1_accuracy for m in all_metrics.values()) / len(all_metrics)
     mean_top5 = sum(m.top5_accuracy for m in all_metrics.values()) / len(all_metrics)
     
-    text_logger.info(f"Mean Top-1: {mean_top1:.2f}%, Mean Top-5: {mean_top5:.2f}%")
+    # Print summary
+    mean_metrics = ClassificationMetrics(top1_accuracy=mean_top1, top5_accuracy=mean_top5, num_samples=0, loss=0.0)
+    formatted = format_classification_results(
+        model_name=model.name,
+        dataset_name=f"ImageNet-C ({len(all_metrics)} corruption combos)",
+        metrics=mean_metrics,
+        precision="fp32",
+    )
+    print("\n" + formatted)
     
     logger.log({
         f"{model.name}/imagenet_c/mean_top1": mean_top1,
@@ -387,19 +408,25 @@ def evaluate_model_on_coco(
     Returns:
         Dictionary with detection metrics (mAP, mAP50, mAP75, etc.).
     """
+    import sys
+    import io
     from src.datasets import get_coco_loader
     from src.evaluation import COCOEvaluator, remap_yolo_to_coco_labels
     from pycocotools.coco import COCO
     
-    text_logger.info(f"Evaluating {model.name} on COCO...")
+    text_logger.info(f"  Evaluating on COCO val2017...")
     
     # Get dataset config
     dataset_config = config.get_dataset("coco")
     
-    # Load COCO ground truth annotations
+    # Load COCO ground truth annotations (suppress verbose output)
     ann_file = Path(dataset_config.root) / "annotations" / "instances_val2017.json"
-    text_logger.info(f"Loading COCO annotations from {ann_file}")
-    coco_gt = COCO(str(ann_file))
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        coco_gt = COCO(str(ann_file))
+    finally:
+        sys.stdout = old_stdout
     
     # Create dataloader (use detection task)
     try:
@@ -411,8 +438,8 @@ def evaluate_model_on_coco(
             debug_samples=config.debug_samples,
         )
     except FileNotFoundError as e:
-        text_logger.error(f"COCO dataset not found: {e}")
-        text_logger.info("Please download COCO dataset using: ./scripts/download_coco.sh")
+        text_logger.error(f"  [!] COCO dataset not found: {e}")
+        text_logger.info("  Please download COCO dataset using: ./scripts/download_coco.sh")
         raise
     
     model.eval()
@@ -476,7 +503,6 @@ def evaluate_model_on_coco(
                 break
     
     # Compute COCO metrics (mAP)
-    text_logger.info("Computing COCO metrics (this may take a moment)...")
     metrics = coco_evaluator.compute()
     
     # Add summary stats
@@ -485,8 +511,15 @@ def evaluate_model_on_coco(
     metrics["total_detections"] = total_detections
     metrics["avg_detections_per_image"] = total_detections / len(all_predictions) if all_predictions else 0
     
-    text_logger.info(f"Results: mAP={metrics['mAP']:.2f}%, mAP50={metrics['mAP50']:.2f}%, mAP75={metrics['mAP75']:.2f}%")
-    text_logger.info(f"         AR@100={metrics['AR_100']:.2f}%, num_images={metrics['num_images']}")
+    # Print formatted results
+    formatted = format_detection_results(
+        model_name=model.name,
+        dataset_name="COCO val2017",
+        metrics=metrics,
+        precision="fp32",
+        verbose=True,  # Show size breakdown
+    )
+    print("\n" + formatted)
     
     # Log to wandb
     logger.log({
@@ -518,9 +551,120 @@ def evaluate_model_on_coco(
         precision="fp32",
     )
     
-    text_logger.info(f"COCO evaluation complete.")
-    
     return metrics
+
+
+# ========================================================================
+# Quantized evaluation helpers
+# ========================================================================
+
+def evaluate_quantized_classification(
+    model: BaseModel,
+    config: ExperimentConfig,
+    checkpoint_manager: CheckpointManager,
+    logger: MetricsLogger,
+    text_logger,
+    mode: str,
+) -> Tuple:
+    """
+    Quantize a classification model with torchao and evaluate on ImageNet.
+
+    The model stays on GPU the entire time.
+
+    Args:
+        model: Original FP32 BaseModel.
+        config: Experiment config.
+        checkpoint_manager: For saving results.
+        logger: Metrics logger.
+        text_logger: Text logger.
+        mode: 'weight_only' or 'weight_and_activation'.
+
+    Returns:
+        (ClassificationMetrics, quantization_stats_dict)
+    """
+    # ── Quantize the backbone ──
+    text_logger.info(f"  Quantizing {model.name} – {mode}...")
+    q_backbone, q_stats = quantize_model(
+        model=model.backbone,
+        mode=mode,
+        device=config.device,
+    )
+
+    # Print quantization stats
+    stats_fmt = format_quantization_stats(
+        model_name=model.name,
+        mode=mode,
+        stats=q_stats,
+    )
+    print("\n" + stats_fmt)
+
+    # ── Evaluate on ImageNet ──
+    text_logger.info(f"  Evaluating INT8 {mode} on ImageNet (GPU)...")
+
+    dataset_config = config.get_dataset("imagenet")
+    dataloader = get_imagenet_loader(
+        config=dataset_config,
+        model_name=model.name,
+        num_workers=config.num_workers,
+        debug=config.debug,
+        debug_samples=config.debug_samples,
+    )
+
+    # Swap backbone temporarily for inference
+    original_backbone = model.backbone
+    model.backbone = q_backbone
+
+    try:
+        results = run_inference(
+            model=model,
+            dataloader=dataloader,
+            device=config.device,
+            logger=logger,
+            description=f"ImageNet - {model.name} [INT8 {mode}]",
+        )
+    finally:
+        # Restore original backbone
+        model.backbone = original_backbone
+
+    metrics = results["metrics"]
+    precision_tag = f"int8_{mode}"
+
+    # Print results
+    formatted = format_classification_results(
+        model_name=model.name,
+        dataset_name="ImageNet",
+        metrics=metrics,
+        precision=precision_tag,
+    )
+    print("\n" + formatted)
+
+    # Log
+    logger.log({
+        f"{model.name}/imagenet/{precision_tag}/top1": metrics.top1_accuracy,
+        f"{model.name}/imagenet/{precision_tag}/top5": metrics.top5_accuracy,
+    })
+
+    # Log quantization stats
+    logger.log({
+        f"{model.name}/quantization/{mode}/original_size_mb": q_stats["original_size_mb"],
+        f"{model.name}/quantization/{mode}/quantized_size_mb": q_stats["quantized_size_mb"],
+        f"{model.name}/quantization/{mode}/compression_ratio": q_stats["compression_ratio"],
+        f"{model.name}/quantization/{mode}/size_reduction_pct": q_stats["size_reduction_pct"],
+    })
+
+    # Save
+    checkpoint_manager.save_metrics(
+        metrics=metrics.to_dict(),
+        model_name=model.name,
+        dataset_name="imagenet",
+        precision=precision_tag,
+    )
+
+    # Free quantized model
+    del q_backbone
+    torch.cuda.empty_cache()
+
+    return metrics, q_stats
 
 
 def main():
@@ -568,29 +712,54 @@ def main():
     else:
         model_configs = config.models
     
-    text_logger.info(f"Models: {[m.name for m in model_configs]}")
-    text_logger.info(f"Datasets: {datasets_to_eval}")
+    # Print experiment header
+    header = format_experiment_header(
+        experiment_name=config.name,
+        config_file=args.config,
+        device=config.device,
+        models=[m.name for m in model_configs],
+        datasets=datasets_to_eval,
+    )
+    text_logger.info(header)
+    
+    # Track task types for final summary
+    task_types = {}
+    for ds_name in datasets_to_eval:
+        if ds_name == "coco":
+            task_types[ds_name] = "detection"
+        else:
+            task_types[ds_name] = "classification"
     
     # Results storage
     all_results = {}
     
+    # Determine quantization modes to run
+    quant_enabled = config.quantization.enabled
+    quant_modes = config.quantization.modes if quant_enabled else []
+    
+    if quant_enabled:
+        text_logger.info(f"  Quantization ENABLED – modes: {quant_modes}")
+    else:
+        text_logger.info(f"  Quantization DISABLED – running FP32 baselines only")
+    
     # Evaluate each model
     for model_config in model_configs:
-        text_logger.info(f"\n{'='*60}")
-        text_logger.info(f"Evaluating model: {model_config.name}")
-        text_logger.info(f"{'='*60}")
-        
         # Create model
         model = ModelFactory.create(model_config, device=config.device)
         model_info = model.get_model_info()
-        text_logger.info(f"Model info: {model_info}")
+        
+        # Print model header
+        model_header = format_model_header(model_config.name, model_info)
+        text_logger.info(model_header)
         
         all_results[model_config.name] = {}
         
-        # Evaluate on each dataset
+        # ── Phase 1: FP32 Baseline ──
+        fp32_results = {}
+        
         for dataset_name in datasets_to_eval:
             if dataset_name not in config.datasets:
-                text_logger.warning(f"Dataset {dataset_name} not in config, skipping")
+                text_logger.warning(f"  [!] Dataset {dataset_name} not in config, skipping")
                 continue
             
             try:
@@ -602,7 +771,8 @@ def main():
                         logger=metrics_logger,
                         text_logger=text_logger,
                     )
-                    all_results[model_config.name][dataset_name] = metrics
+                    fp32_results[dataset_name] = metrics
+                    all_results[model_config.name][dataset_name] = {"fp32": metrics}
                     
                 elif dataset_name == "imagenet_c":
                     metrics = evaluate_model_on_imagenet_c(
@@ -612,7 +782,8 @@ def main():
                         logger=metrics_logger,
                         text_logger=text_logger,
                     )
-                    all_results[model_config.name][dataset_name] = metrics
+                    fp32_results[dataset_name] = metrics
+                    all_results[model_config.name][dataset_name] = {"fp32": metrics}
                 
                 elif dataset_name == "coco":
                     metrics = evaluate_model_on_coco(
@@ -622,7 +793,8 @@ def main():
                         logger=metrics_logger,
                         text_logger=text_logger,
                     )
-                    all_results[model_config.name][dataset_name] = metrics
+                    fp32_results[dataset_name] = metrics
+                    all_results[model_config.name][dataset_name] = {"fp32": metrics}
                     
                 else:
                     text_logger.warning(
@@ -630,42 +802,87 @@ def main():
                     )
                     
             except FileNotFoundError as e:
-                text_logger.error(f"Dataset not found: {e}")
+                text_logger.error(f"  [!] Dataset not found: {e}")
                 continue
             except Exception as e:
-                text_logger.error(f"Error evaluating on {dataset_name}: {e}")
+                text_logger.error(f"  [!] Error evaluating on {dataset_name}: {e}")
                 raise
+        
+        # ── Phase 2: Quantized Evaluation ──
+        if quant_enabled and quant_modes:
+            for qmode in quant_modes:
+                text_logger.info(f"\n  ── INT8 {qmode} quantization ──")
+
+                if model.task != "classification":
+                    text_logger.info(
+                        f"  Skipping quantization for {model_config.name} "
+                        f"(task={model.task}, classification only for now)"
+                    )
+                    continue
+
+                try:
+                    q_metrics, q_stats = evaluate_quantized_classification(
+                        model=model,
+                        config=config,
+                        checkpoint_manager=checkpoint_manager,
+                        logger=metrics_logger,
+                        text_logger=text_logger,
+                        mode=qmode,
+                    )
+
+                    # Store results
+                    prec_key = f"int8_{qmode}"
+                    if "imagenet" in all_results[model_config.name]:
+                        all_results[model_config.name]["imagenet"][prec_key] = q_metrics
+                    else:
+                        all_results[model_config.name]["imagenet"] = {prec_key: q_metrics}
+
+                    # Print comparison
+                    fp32_m = fp32_results.get("imagenet")
+                    if fp32_m is not None:
+                        comparison = format_comparison_row(
+                            model_name=model_config.name,
+                            dataset_name="imagenet",
+                            task="classification",
+                            fp32_metrics=fp32_m,
+                            quant_metrics=q_metrics,
+                            quant_mode=qmode,
+                            quant_stats=q_stats,
+                        )
+                        print("\n" + comparison)
+
+                except Exception as e:
+                    text_logger.error(
+                        f"  [!] Error during INT8 {qmode} for {model_config.name}: {e}"
+                    )
+                    import traceback
+                    traceback.print_exc()
+                    continue
         
         # Clear model from memory
         del model
         torch.cuda.empty_cache()
     
-    # Log final summary
-    text_logger.info(f"\n{'='*60}")
-    text_logger.info("FINAL SUMMARY")
-    text_logger.info(f"{'='*60}")
+    # Log final summary using unified formatting
+    # Flatten nested results for backward-compat with format_final_summary
+    flat_results = {}
+    for mname, ds_dict in all_results.items():
+        flat_results[mname] = {}
+        for ds_name, prec_dict in ds_dict.items():
+            if isinstance(prec_dict, dict) and "fp32" in prec_dict:
+                # New nested format – use fp32 for top-level summary
+                flat_results[mname][ds_name] = prec_dict["fp32"]
+            else:
+                flat_results[mname][ds_name] = prec_dict
     
-    for model_name, model_results in all_results.items():
-        text_logger.info(f"\n{model_name}:")
-        for dataset_name, metrics in model_results.items():
-            if isinstance(metrics, ClassificationMetrics):
-                text_logger.info(f"  {dataset_name}: {metrics}")
-            elif isinstance(metrics, dict):
-                # Check if it's ImageNet-C results (has ClassificationMetrics) or detection results
-                first_value = next(iter(metrics.values()), None)
-                if isinstance(first_value, ClassificationMetrics):
-                    # ImageNet-C results
-                    mean_top1 = sum(m.top1_accuracy for m in metrics.values()) / len(metrics)
-                    text_logger.info(f"  {dataset_name}: Mean Top-1 = {mean_top1:.2f}%")
-                else:
-                    # Detection results (dict with num_images, total_detections, etc.)
-                    text_logger.info(f"  {dataset_name}: {metrics}")
+    summary = format_final_summary(flat_results, task_types)
+    text_logger.info(summary)
     
     # Finish wandb
     if wandb_logger:
         wandb_logger.finish()
     
-    text_logger.info("\nExperiment completed!")
+    text_logger.info("Experiment completed successfully!")
     
     return all_results
 

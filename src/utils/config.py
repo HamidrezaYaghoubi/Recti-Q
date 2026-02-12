@@ -70,37 +70,20 @@ class DatasetConfig:
 
 
 @dataclass
-class CalibrationConfig:
-    """Configuration for quantization calibration."""
-    method: str = "minmax"
-    num_samples: int = 1000
-    percentile: float = 99.99
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CalibrationConfig":
-        """Create CalibrationConfig from dictionary."""
-        return cls(
-            method=data.get("method", "minmax"),
-            num_samples=data.get("num_samples", 1000),
-            percentile=data.get("percentile", 99.99),
-        )
-
-
-@dataclass
 class QuantizationConfig:
-    """Configuration for quantization settings."""
+    """Configuration for torchao INT8 quantization."""
     enabled: bool = False
-    precision: List[str] = field(default_factory=lambda: ["int8"])
-    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    modes: List[str] = field(default_factory=lambda: ["weight_only"])
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QuantizationConfig":
         """Create QuantizationConfig from dictionary."""
-        calibration_data = data.get("calibration", {})
+        modes = data.get("modes", ["weight_only"])
+        if isinstance(modes, str):
+            modes = [modes]
         return cls(
             enabled=data.get("enabled", False),
-            precision=data.get("precision", ["int8"]),
-            calibration=CalibrationConfig.from_dict(calibration_data),
+            modes=modes,
         )
 
 

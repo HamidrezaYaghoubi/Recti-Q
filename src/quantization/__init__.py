@@ -1,17 +1,15 @@
-"""
-Quantization module for applying quantization to models.
-
-This module will be fully implemented in Week 2-3.
-"""
+"""Quantization module – torchao-based INT8 PTQ."""
 
 from src.quantization.quantizer import (
-    Quantizer,
-    QuantizationConfig,
+    QUANT_MODES,
     quantize_model,
+    get_model_size_mb,
+    count_layers,
 )
 
 __all__ = [
-    "Quantizer",
-    "QuantizationConfig",
+    "QUANT_MODES",
     "quantize_model",
+    "get_model_size_mb",
+    "count_layers",
 ]

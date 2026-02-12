@@ -1,0 +1,64 @@
+# INT8 Quantization – Classification Models (torchao)
+# Runs FP32 baseline + INT8 quantized variants for each model on ImageNet
+
+experiment:
+  name: "quantize_classification"
+  description: "INT8 PTQ for classification models using torchao (GPU-native)"
+  seed: 42
+  device: "cuda"
+  num_workers: 8
+  debug: false
+  debug_samples: 100
+
+models:
+  - name: "resnet50"
+    architecture: "resnet50"
+    weights: "IMAGENET1K_V2"
+    task: "classification"
+    num_classes: 1000
+
+  - name: "mobilenetv2"
+    architecture: "mobilenet_v2"
+    weights: "IMAGENET1K_V1"
+    task: "classification"
+    num_classes: 1000
+
+  - name: "vit_base"
+    architecture: "vit_b_16"
+    weights: "IMAGENET1K_V1"
+    task: "classification"
+    num_classes: 1000
+
+datasets:
+  imagenet:
+    name: "imagenet"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet/validation"
+    split: "val"
+    batch_size: 256
+    shuffle: false
+    num_workers: 8
+    pin_memory: true
+
+quantization:
+  enabled: true
+  # modes: ["weight_only", "weight_and_activation"]
+  modes: ["weight_and_activation"]
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_dir: "./logs"
+  wandb:
+    enabled: true
+    project: "quantization-decision-analysis"
+    entity: null
+    tags: ["quantization", "int8", "classification", "imagenet", "torchao"]
+    notes: "Week 2: INT8 PTQ via torchao (GPU-native)"
+
+output:
+  save_predictions: true
+  prediction_format: "pickle"
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  save_logits: true
+  save_confidence: true

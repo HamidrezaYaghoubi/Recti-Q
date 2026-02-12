@@ -1,0 +1,67 @@
+# INT8 Quantization – YOLO Detection Models
+# YOLO uses ultralytics which has its own export/quantization pipeline.
+# For now we apply torch dynamic quantization to the PyTorch backbone,
+# and compare with ultralytics ONNX INT8 export in a later phase.
+
+experiment:
+  name: "quantize_yolo"
+  description: "INT8 post-training quantization for YOLO models on COCO"
+  seed: 42
+  device: "cuda"
+  num_workers: 4
+  debug: false
+  debug_samples: 100
+
+models:
+  - name: "yolov8n"
+    architecture: "yolov8n"
+    weights: "COCO"
+    task: "detection"
+    num_classes: 80
+
+  - name: "yolov8m"
+    architecture: "yolov8m"
+    weights: "COCO"
+    task: "detection"
+    num_classes: 80
+
+datasets:
+  coco:
+    name: "coco"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/coco"
+    split: "val2017"
+    batch_size: 16
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+
+quantization:
+  enabled: true
+  modes: ["dynamic"]              # Dynamic only for YOLO (safe start)
+  precision: ["int8"]
+  backend: "x86"
+  per_channel: true
+  num_calibration_batches: 50
+  calibration:
+    method: "minmax"
+    num_samples: 500
+  skip_layers: []
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_dir: "./logs"
+  wandb:
+    enabled: true
+    project: "quantization-decision-analysis"
+    entity: null
+    tags: ["quantization", "int8", "detection", "yolo", "coco"]
+    notes: "Week 2: INT8 quantization for YOLO models"
+
+output:
+  save_predictions: true
+  prediction_format: "pickle"
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  save_boxes: true
+  save_scores: true

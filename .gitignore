@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ── Project-specific ──
+# Experiment outputs (large files)
+results/
+!results/.gitkeep
+
+# Wandb run logs
+wandb/
+
+# Checkpoints & model weights
+checkpoints/
+!checkpoints/.gitkeep
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+logs/
+!logs/.gitkeep
+run_log.txt
+*.log

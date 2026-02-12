@@ -1,340 +1,151 @@
 """
-Quantization implementation.
+INT8 Post-Training Quantization using torchao.
 
-This module provides the quantization functionality for converting
-FP32 models to INT8/INT4/INT2 precision.
+Applies GPU-native quantization via torchao's quantize_() API.
+Two modes:
+  - weight_only:          INT8 weight-only (activations stay FP32)
+  - weight_and_activation: INT8 weights + INT8 dynamic activations
 
-TODO: Week 2-3 Implementation
-- Implement PyTorch native quantization (torch.quantization)
-- Add TensorRT backend support
-- Add ONNX Runtime quantization support
-- Implement calibration methods (MinMax, Percentile, Entropy)
-- Add per-layer sensitivity analysis
+Both run entirely on GPU – no CPU transfer needed.
+
+Usage:
+    from src.quantization import quantize_model
+
+    q_model, stats = quantize_model(model, mode="weight_only")
+    q_model, stats = quantize_model(model, mode="weight_and_activation")
 """
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Union
+import copy
+import time
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torchao.quantization import (
+    quantize_,
+    Int8WeightOnlyConfig,
+    Int8DynamicActivationInt8WeightConfig,
+)
 
 from src.utils.logging import get_logger
 
 logger = get_logger("qda.quantization")
 
 
-class QuantizationPrecision(Enum):
-    """Quantization precision levels."""
-    FP32 = "fp32"
-    FP16 = "fp16"
-    INT8 = "int8"
-    INT4 = "int4"
-    INT2 = "int2"
+# Valid quantization modes
+QUANT_MODES = {
+    "weight_only": "INT8 weight-only (activations FP32)",
+    "weight_and_activation": "INT8 weights + INT8 dynamic activations",
+}
 
 
-class CalibrationMethod(Enum):
-    """Calibration methods for determining quantization parameters."""
-    MINMAX = "minmax"
-    PERCENTILE = "percentile"
-    ENTROPY = "entropy"
-    MSE = "mse"
+# ============================================================================
+# Helpers
+# ============================================================================
 
-
-@dataclass
-class QuantizationConfig:
+def get_model_size_mb(model: nn.Module) -> float:
     """
-    Configuration for quantization.
-    
-    Attributes:
-        precision: Target precision level.
-        calibration_method: Method for calibrating quantization ranges.
-        num_calibration_samples: Number of samples for calibration.
-        percentile: Percentile for percentile-based calibration.
-        per_channel: Whether to use per-channel quantization.
-        symmetric: Whether to use symmetric quantization.
+    Compute serialised model size in MB.
+
+    Uses torch.save to a BytesIO buffer so that torchao's quantized
+    tensor subclasses (which store int8 data internally) are measured
+    correctly — plain p.element_size() always reports 4 for them.
     """
-    precision: QuantizationPrecision = QuantizationPrecision.INT8
-    calibration_method: CalibrationMethod = CalibrationMethod.MINMAX
-    num_calibration_samples: int = 1000
-    percentile: float = 99.99
-    per_channel: bool = True
-    symmetric: bool = True
-    
-    # Layer-specific settings
-    skip_layers: List[str] = field(default_factory=list)
-    sensitive_layers: List[str] = field(default_factory=list)
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "QuantizationConfig":
-        """Create config from dictionary."""
-        precision = data.get("precision", "int8")
-        if isinstance(precision, str):
-            precision = QuantizationPrecision(precision.lower())
-        
-        method = data.get("calibration_method", "minmax")
-        if isinstance(method, str):
-            method = CalibrationMethod(method.lower())
-        
-        return cls(
-            precision=precision,
-            calibration_method=method,
-            num_calibration_samples=data.get("num_calibration_samples", 1000),
-            percentile=data.get("percentile", 99.99),
-            per_channel=data.get("per_channel", True),
-            symmetric=data.get("symmetric", True),
-            skip_layers=data.get("skip_layers", []),
-            sensitive_layers=data.get("sensitive_layers", []),
-        )
+    import io
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    return buffer.tell() / (1024 ** 2)
 
 
-class BaseQuantizer(ABC):
+def count_layers(model: nn.Module) -> Dict[str, int]:
     """
-    Abstract base class for quantizers.
-    
-    Different quantization backends (PyTorch, TensorRT, ONNX)
-    should inherit from this class.
+    Count layer types in a model.
+    Returns dict with counts for Linear, Conv2d, and total modules.
     """
-    
-    def __init__(self, config: QuantizationConfig):
-        """
-        Initialize quantizer.
-        
-        Args:
-            config: Quantization configuration.
-        """
-        self.config = config
-        self._calibration_data: Optional[List[torch.Tensor]] = None
-    
-    @abstractmethod
-    def quantize(
-        self,
-        model: nn.Module,
-        calibration_loader: Optional[DataLoader] = None,
-    ) -> nn.Module:
-        """
-        Quantize a model.
-        
-        Args:
-            model: Model to quantize.
-            calibration_loader: DataLoader for calibration data.
-            
-        Returns:
-            Quantized model.
-        """
-        pass
-    
-    @abstractmethod
-    def calibrate(
-        self,
-        model: nn.Module,
-        calibration_loader: DataLoader,
-    ) -> None:
-        """
-        Calibrate quantization parameters.
-        
-        Args:
-            model: Model to calibrate.
-            calibration_loader: DataLoader for calibration data.
-        """
-        pass
-    
-    def collect_calibration_data(
-        self,
-        loader: DataLoader,
-        num_samples: Optional[int] = None,
-    ) -> List[torch.Tensor]:
-        """
-        Collect calibration data from a DataLoader.
-        
-        Args:
-            loader: DataLoader to collect data from.
-            num_samples: Number of samples to collect.
-            
-        Returns:
-            List of input tensors.
-        """
-        num_samples = num_samples or self.config.num_calibration_samples
-        calibration_data = []
-        collected = 0
-        
-        for batch in loader:
-            if isinstance(batch, (list, tuple)):
-                inputs = batch[0]
-            else:
-                inputs = batch
-            
-            calibration_data.append(inputs)
-            collected += inputs.size(0)
-            
-            if collected >= num_samples:
-                break
-        
-        logger.info(f"Collected {collected} samples for calibration")
-        return calibration_data
+    counts = {"Linear": 0, "Conv2d": 0, "total": 0}
+    for module in model.modules():
+        counts["total"] += 1
+        if isinstance(module, nn.Linear):
+            counts["Linear"] += 1
+        elif isinstance(module, nn.Conv2d):
+            counts["Conv2d"] += 1
+    return counts
 
 
-class Quantizer(BaseQuantizer):
-    """
-    Main quantizer class using PyTorch's quantization API.
-    
-    TODO: Week 2 - Full implementation
-    """
-    
-    def __init__(self, config: QuantizationConfig):
-        """Initialize PyTorch quantizer."""
-        super().__init__(config)
-        self._is_calibrated = False
-    
-    def quantize(
-        self,
-        model: nn.Module,
-        calibration_loader: Optional[DataLoader] = None,
-    ) -> nn.Module:
-        """
-        Quantize a model to the target precision.
-        
-        Args:
-            model: FP32 model to quantize.
-            calibration_loader: DataLoader for calibration.
-            
-        Returns:
-            Quantized model.
-            
-        TODO: Week 2 Implementation
-        - Add PTQ (Post-Training Quantization) support
-        - Add QAT (Quantization-Aware Training) support
-        - Support different backends (fbgemm, qnnpack)
-        """
-        logger.warning(
-            "Quantization not yet implemented. "
-            "Returning original model. "
-            "Full implementation coming in Week 2."
-        )
-        
-        # Placeholder: Return original model
-        return model
-    
-    def calibrate(
-        self,
-        model: nn.Module,
-        calibration_loader: DataLoader,
-    ) -> None:
-        """
-        Calibrate quantization parameters.
-        
-        TODO: Week 2 Implementation
-        - Implement MinMax calibration
-        - Implement Percentile calibration
-        - Implement Entropy calibration
-        """
-        logger.warning(
-            "Calibration not yet implemented. "
-            "Full implementation coming in Week 2."
-        )
-        self._is_calibrated = True
-    
-    def get_quantization_stats(
-        self,
-        model: nn.Module,
-    ) -> Dict[str, Any]:
-        """
-        Get quantization statistics for a model.
-        
-        Returns statistics about weight ranges, activation ranges,
-        and other quantization-relevant metrics.
-        
-        TODO: Week 2 Implementation
-        """
-        stats = {
-            "precision": self.config.precision.value,
-            "calibration_method": self.config.calibration_method.value,
-            "is_calibrated": self._is_calibrated,
-        }
-        return stats
-
-
-class TensorRTQuantizer(BaseQuantizer):
-    """
-    TensorRT-based quantizer for optimized inference.
-    
-    TODO: Week 3 Implementation
-    """
-    
-    def quantize(
-        self,
-        model: nn.Module,
-        calibration_loader: Optional[DataLoader] = None,
-    ) -> nn.Module:
-        """Quantize using TensorRT."""
-        raise NotImplementedError(
-            "TensorRT quantization coming in Week 3"
-        )
-    
-    def calibrate(
-        self,
-        model: nn.Module,
-        calibration_loader: DataLoader,
-    ) -> None:
-        """Calibrate for TensorRT."""
-        raise NotImplementedError(
-            "TensorRT calibration coming in Week 3"
-        )
-
+# ============================================================================
+# Main API
+# ============================================================================
 
 def quantize_model(
     model: nn.Module,
-    precision: str = "int8",
-    calibration_loader: Optional[DataLoader] = None,
-    calibration_method: str = "minmax",
-    num_samples: int = 1000,
-) -> nn.Module:
+    mode: str = "weight_only",
+    device: Optional[str] = None,
+) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    Convenience function to quantize a model.
-    
+    Quantize a model using torchao.
+
+    The model is deep-copied so the original stays untouched.
+    quantize_() is applied in-place on the copy.
+
     Args:
-        model: Model to quantize.
-        precision: Target precision ('int8', 'int4', etc.).
-        calibration_loader: DataLoader for calibration.
-        calibration_method: Calibration method.
-        num_samples: Number of calibration samples.
-        
+        model:  The nn.Module to quantize (e.g. model.backbone).
+        mode:   "weight_only" or "weight_and_activation".
+        device: Device for quantization (default: keep current device).
+
     Returns:
-        Quantized model.
+        (quantized_model, stats_dict)
     """
-    config = QuantizationConfig(
-        precision=QuantizationPrecision(precision.lower()),
-        calibration_method=CalibrationMethod(calibration_method.lower()),
-        num_calibration_samples=num_samples,
+    if mode not in QUANT_MODES:
+        raise ValueError(
+            f"Unknown mode '{mode}'. Choose from: {list(QUANT_MODES.keys())}"
+        )
+
+    logger.info(f"Quantizing model – mode={mode}")
+
+    # Measure original size
+    original_size = get_model_size_mb(model)
+    original_layers = count_layers(model)
+
+    # Deep copy so the original model is not mutated
+    q_model = copy.deepcopy(model)
+    q_model.eval()
+
+    # Move to target device if specified
+    if device is not None:
+        q_model = q_model.to(device)
+
+    # Pick config
+    if mode == "weight_only":
+        config = Int8WeightOnlyConfig()
+    else:
+        config = Int8DynamicActivationInt8WeightConfig()
+
+    # Apply quantization (in-place, targets nn.Linear by default)
+    t0 = time.time()
+    quantize_(q_model, config)
+    quant_time = time.time() - t0
+
+    # Measure quantized size
+    quantized_size = get_model_size_mb(q_model)
+    quantized_layers = count_layers(q_model)
+
+    # Build stats
+    stats = {
+        "mode": mode,
+        "mode_description": QUANT_MODES[mode],
+        "original_size_mb": original_size,
+        "quantized_size_mb": quantized_size,
+        "compression_ratio": original_size / max(quantized_size, 1e-6),
+        "size_reduction_pct": (1 - quantized_size / max(original_size, 1e-6)) * 100,
+        "quantization_time_s": quant_time,
+        "original_layers": original_layers,
+        "quantized_layers": quantized_layers,
+        "target_layers": "nn.Linear (torchao default)",
+    }
+
+    logger.info(
+        f"  Done – {original_size:.1f} MB → {quantized_size:.1f} MB "
+        f"({stats['compression_ratio']:.2f}x) in {quant_time:.1f}s"
     )
-    
-    quantizer = Quantizer(config)
-    return quantizer.quantize(model, calibration_loader)
 
-
-# TODO: Week 2-3 - Additional features to implement:
-# 
-# 1. Per-layer sensitivity analysis
-#    - Measure accuracy drop when quantizing each layer
-#    - Identify sensitive layers to keep in higher precision
-#
-# 2. Mixed-precision quantization
-#    - Some layers in INT8, others in FP16
-#    - Based on sensitivity analysis
-#
-# 3. Quantization-aware training (QAT)
-#    - Fine-tune with simulated quantization
-#    - Recover accuracy lost during PTQ
-#
-# 4. Custom calibration observers
-#    - MinMax: Use min/max values
-#    - Percentile: Use percentile values (reduce outlier impact)
-#    - Entropy: Minimize KL divergence
-#    - MSE: Minimize mean squared error
-#
-# 5. Export quantized models
-#    - ONNX export with quantization ops
-#    - TorchScript export
-#    - TensorRT engine serialization
+    return q_model, stats
