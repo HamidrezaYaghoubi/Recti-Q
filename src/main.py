@@ -41,7 +41,7 @@ from src.utils.formatting import (
 from src.models import ModelFactory, BaseModel
 from src.datasets import get_imagenet_loader, get_imagenet_c_loader, get_all_imagenet_c_loaders
 from src.evaluation import MetricsComputer, ClassificationMetrics
-from src.quantization import quantize_model, QUANT_MODES
+from src.quantization import quantize_model, QUANT_MODES, resolve_mode, get_model_size_mb
 
 
 def parse_args() -> argparse.Namespace:
@@ -577,11 +577,13 @@ def evaluate_quantized_classification(
         checkpoint_manager: For saving results.
         logger: Metrics logger.
         text_logger: Text logger.
-        mode: 'weight_only' or 'weight_and_activation'.
+        mode: One of QUANT_MODES keys ('W8A16', 'W8A8', 'W4A16', etc.).
 
     Returns:
         (ClassificationMetrics, quantization_stats_dict)
     """
+    mode = resolve_mode(mode)  # handle aliases
+
     # ── Quantize the backbone ──
     text_logger.info(f"  Quantizing {model.name} – {mode}...")
     q_backbone, q_stats = quantize_model(
@@ -599,7 +601,7 @@ def evaluate_quantized_classification(
     print("\n" + stats_fmt)
 
     # ── Evaluate on ImageNet ──
-    text_logger.info(f"  Evaluating INT8 {mode} on ImageNet (GPU)...")
+    text_logger.info(f"  Evaluating {mode} on ImageNet (GPU)...")
 
     dataset_config = config.get_dataset("imagenet")
     dataloader = get_imagenet_loader(
@@ -620,44 +622,29 @@ def evaluate_quantized_classification(
             dataloader=dataloader,
             device=config.device,
             logger=logger,
-            description=f"ImageNet - {model.name} [INT8 {mode}]",
+            description=f"ImageNet - {model.name} [{mode}]",
         )
     finally:
         # Restore original backbone
         model.backbone = original_backbone
 
     metrics = results["metrics"]
-    precision_tag = f"int8_{mode}"
 
     # Print results
     formatted = format_classification_results(
         model_name=model.name,
         dataset_name="ImageNet",
         metrics=metrics,
-        precision=precision_tag,
+        precision=mode,
     )
     print("\n" + formatted)
-
-    # Log
-    logger.log({
-        f"{model.name}/imagenet/{precision_tag}/top1": metrics.top1_accuracy,
-        f"{model.name}/imagenet/{precision_tag}/top5": metrics.top5_accuracy,
-    })
-
-    # Log quantization stats
-    logger.log({
-        f"{model.name}/quantization/{mode}/original_size_mb": q_stats["original_size_mb"],
-        f"{model.name}/quantization/{mode}/quantized_size_mb": q_stats["quantized_size_mb"],
-        f"{model.name}/quantization/{mode}/compression_ratio": q_stats["compression_ratio"],
-        f"{model.name}/quantization/{mode}/size_reduction_pct": q_stats["size_reduction_pct"],
-    })
 
     # Save
     checkpoint_manager.save_metrics(
         metrics=metrics.to_dict(),
         model_name=model.name,
         dataset_name="imagenet",
-        precision=precision_tag,
+        precision=mode,
     )
 
     # Free quantized model
@@ -665,6 +652,73 @@ def evaluate_quantized_classification(
     torch.cuda.empty_cache()
 
     return metrics, q_stats
+
+
+def _log_wandb_comparison(
+    wandb_logger,
+    model_name: str,
+    all_results: Dict[str, Any],
+):
+    """
+    Log a wandb comparison table + bar charts for one model.
+
+    Creates a single table with columns:
+      [precision, top1, top5, size_mb, compression_ratio]
+    and bar chart visualizations so all configs appear in one plot.
+    """
+    if wandb_logger is None or not wandb_logger.enabled:
+        return
+
+    try:
+        import wandb
+    except ImportError:
+        return
+
+    # Build table data
+    columns = ["precision", "top1", "top5", "size_mb", "compression_ratio"]
+    rows = []
+
+    for prec_key, entry in all_results.items():
+        metrics = entry.get("metrics")
+        stats = entry.get("stats")
+        if metrics is None:
+            continue
+        t1 = metrics.top1_accuracy if hasattr(metrics, "top1_accuracy") else metrics.get("top1_accuracy", 0)
+        t5 = metrics.top5_accuracy if hasattr(metrics, "top5_accuracy") else metrics.get("top5_accuracy", 0)
+        if stats:
+            size = stats.get("quantized_size_mb", stats.get("original_size_mb", 0))
+            cr = stats.get("compression_ratio", 1.0)
+        else:
+            size = 0
+            cr = 1.0
+        rows.append([prec_key, t1, t5, size, cr])
+
+    if not rows:
+        return
+
+    # Log table
+    table = wandb.Table(columns=columns, data=rows)
+    wandb.log({f"{model_name}/comparison_table": table})
+
+    # Log bar charts  (grouped bar chart via wandb.plot.bar)
+    wandb.log({
+        f"{model_name}/top1_comparison": wandb.plot.bar(
+            table, "precision", "top1",
+            title=f"{model_name} – Top-1 Accuracy by Precision",
+        ),
+        f"{model_name}/top5_comparison": wandb.plot.bar(
+            table, "precision", "top5",
+            title=f"{model_name} – Top-5 Accuracy by Precision",
+        ),
+        f"{model_name}/size_comparison": wandb.plot.bar(
+            table, "precision", "size_mb",
+            title=f"{model_name} – Model Size (MB) by Precision",
+        ),
+        f"{model_name}/compression_comparison": wandb.plot.bar(
+            table, "precision", "compression_ratio",
+            title=f"{model_name} – Compression Ratio by Precision",
+        ),
+    })
 
 
 def main():
@@ -809,9 +863,27 @@ def main():
                 raise
         
         # ── Phase 2: Quantized Evaluation ──
+        # Collect per-precision results for wandb comparison chart
+        model_comparison = {}  # precision_key -> {"metrics": ..., "stats": ...}
+
+        # Add FP32 baseline to comparison
+        fp32_im = fp32_results.get("imagenet")
+        if fp32_im is not None:
+            fp32_size = get_model_size_mb(model.backbone)
+            model_comparison["FP32"] = {
+                "metrics": fp32_im,
+                "stats": {
+                    "original_size_mb": fp32_size,
+                    "quantized_size_mb": fp32_size,
+                    "compression_ratio": 1.0,
+                    "size_reduction_pct": 0.0,
+                },
+            }
+
         if quant_enabled and quant_modes:
             for qmode in quant_modes:
-                text_logger.info(f"\n  ── INT8 {qmode} quantization ──")
+                resolved = resolve_mode(qmode)
+                text_logger.info(f"\n  ── {resolved} quantization ──")
 
                 if model.task != "classification":
                     text_logger.info(
@@ -831,33 +903,45 @@ def main():
                     )
 
                     # Store results
-                    prec_key = f"int8_{qmode}"
                     if "imagenet" in all_results[model_config.name]:
-                        all_results[model_config.name]["imagenet"][prec_key] = q_metrics
+                        all_results[model_config.name]["imagenet"][resolved] = q_metrics
                     else:
-                        all_results[model_config.name]["imagenet"] = {prec_key: q_metrics}
+                        all_results[model_config.name]["imagenet"] = {resolved: q_metrics}
 
-                    # Print comparison
-                    fp32_m = fp32_results.get("imagenet")
-                    if fp32_m is not None:
+                    # Store for comparison chart
+                    model_comparison[resolved] = {
+                        "metrics": q_metrics,
+                        "stats": q_stats,
+                    }
+
+                    # Print comparison vs FP32
+                    if fp32_im is not None:
                         comparison = format_comparison_row(
                             model_name=model_config.name,
                             dataset_name="imagenet",
                             task="classification",
-                            fp32_metrics=fp32_m,
+                            fp32_metrics=fp32_im,
                             quant_metrics=q_metrics,
-                            quant_mode=qmode,
+                            quant_mode=resolved,
                             quant_stats=q_stats,
                         )
                         print("\n" + comparison)
 
                 except Exception as e:
                     text_logger.error(
-                        f"  [!] Error during INT8 {qmode} for {model_config.name}: {e}"
+                        f"  [!] Error during {resolved} for {model_config.name}: {e}"
                     )
                     import traceback
                     traceback.print_exc()
                     continue
+
+        # ── Log wandb comparison table + bar charts for this model ──
+        if model_comparison:
+            _log_wandb_comparison(
+                wandb_logger=wandb_logger,
+                model_name=model_config.name,
+                all_results=model_comparison,
+            )
         
         # Clear model from memory
         del model

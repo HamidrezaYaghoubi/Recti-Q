@@ -1,9 +1,17 @@
-# INT8 Quantization – Classification Models (torchao)
-# Runs FP32 baseline + INT8 quantized variants for each model on ImageNet
+# PTQ – Classification Models (torchao, GPU-native)
+# Runs FP32 baseline + quantized variants for each model on ImageNet
+#
+# Available modes: W8A16, W8A8, W4A16, FP8wo, FP8, W4A8fp
+#   W8A16  – INT8 weight-only
+#   W8A8   – INT8 dynamic activation + INT8 weight
+#   W4A16  – INT4 weight-only (group-wise, group_size=128)
+#   FP8wo  – Float8 (E4M3) weight-only
+#   FP8    – Float8 dynamic activation + Float8 weight
+#   W4A8fp – Float8 activation + INT4 weight
 
 experiment:
   name: "quantize_classification"
-  description: "INT8 PTQ for classification models using torchao (GPU-native)"
+  description: "PTQ for classification models using torchao (GPU-native)"
   seed: 42
   device: "cuda"
   num_workers: 8
@@ -41,8 +49,8 @@ datasets:
 
 quantization:
   enabled: true
-  # modes: ["weight_only", "weight_and_activation"]
-  modes: ["weight_and_activation"]
+  # Full set: ["W8A16", "W8A8", "W4A16", "FP8wo", "FP8", "W4A8fp"]
+  modes: ["W8A16", "W8A8", "W4A16"]
 
 logging:
   level: "INFO"
@@ -52,8 +60,8 @@ logging:
     enabled: true
     project: "quantization-decision-analysis"
     entity: null
-    tags: ["quantization", "int8", "classification", "imagenet", "torchao"]
-    notes: "Week 2: INT8 PTQ via torchao (GPU-native)"
+    tags: ["quantization", "ptq", "classification", "imagenet", "torchao"]
+    notes: "Week 2: Multi-precision PTQ via torchao (GPU-native)"
 
 output:
   save_predictions: true
