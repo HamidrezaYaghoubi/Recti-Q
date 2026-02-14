@@ -28,10 +28,6 @@ from torchao.quantization import (
     quantize_,
     Int8WeightOnlyConfig,
     Int8DynamicActivationInt8WeightConfig,
-    Int4WeightOnlyConfig,
-    Float8WeightOnlyConfig,
-    Float8DynamicActivationFloat8WeightConfig,
-    Float8DynamicActivationInt4WeightConfig,
 )
 
 from src.utils.logging import get_logger
@@ -62,17 +58,32 @@ _ALIASES = {
 
 
 def _get_torchao_config(mode: str):
-    """Return the torchao config object for a given mode."""
-    configs = {
-        "W8A16":  Int8WeightOnlyConfig,
-        "W8A8":   Int8DynamicActivationInt8WeightConfig,
-        "W4A16":  lambda: Int4WeightOnlyConfig(group_size=128),
-        "FP8wo":  Float8WeightOnlyConfig,
-        "FP8":    Float8DynamicActivationFloat8WeightConfig,
-        "W4A8fp": Float8DynamicActivationInt4WeightConfig,
-    }
-    factory = configs[mode]
-    return factory() if callable(factory) else factory
+    """Return the torchao config object for a given mode.
+
+    INT4 and FP8 configs are imported lazily so the module can load
+    even when fbgemm-gpu-genai is missing or incompatible.
+    """
+    # INT8 – always available
+    if mode == "W8A16":
+        return Int8WeightOnlyConfig()
+    if mode == "W8A8":
+        return Int8DynamicActivationInt8WeightConfig()
+
+    # Lazy imports for configs that may need extra deps (fbgemm, fp8 hw)
+    if mode == "W4A16":
+        from torchao.quantization import Int4WeightOnlyConfig
+        return Int4WeightOnlyConfig(group_size=128)
+    if mode == "FP8wo":
+        from torchao.quantization import Float8WeightOnlyConfig
+        return Float8WeightOnlyConfig()
+    if mode == "FP8":
+        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
+        return Float8DynamicActivationFloat8WeightConfig()
+    if mode == "W4A8fp":
+        from torchao.quantization import Float8DynamicActivationInt4WeightConfig
+        return Float8DynamicActivationInt4WeightConfig()
+
+    raise ValueError(f"Unknown mode '{mode}'")
 
 
 # ============================================================================

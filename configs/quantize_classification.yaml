@@ -50,7 +50,9 @@ datasets:
 quantization:
   enabled: true
   # Full set: ["W8A16", "W8A8", "W4A16", "FP8wo", "FP8", "W4A8fp"]
-  modes: ["W8A16", "W8A8", "W4A16"]
+  # Note: W4A16 and W4A8fp require fbgemm-gpu-genai compatible with your PyTorch version.
+  #       FP8wo and FP8 require a GPU with FP8 support (e.g. H100, Ada Lovelace).
+  modes: ["W8A16", "W8A8"]
 
 logging:
   level: "INFO"
