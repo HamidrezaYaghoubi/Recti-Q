@@ -50,10 +50,13 @@ QUANT_MODES = {
     "W4A8fp": "INT4 weights + FP8 dynamic activations",
 }
 
-# Keep old names as aliases for backward compat
+# Keep old and human-friendly names as aliases for backward compat
 _ALIASES = {
     "weight_only": "W8A16",
     "weight_and_activation": "W8A8",
+    "dynamic": "W8A8",
+    "int8": "W8A8",
+    "int4": "W4A16",
 }
 
 
@@ -124,13 +127,22 @@ def count_layers(model: nn.Module) -> Dict[str, int]:
 # ============================================================================
 
 def resolve_mode(mode: str) -> str:
-    """Resolve aliases (e.g. 'weight_only' → 'W8A16') and validate."""
-    mode = _ALIASES.get(mode, mode)
-    if mode not in QUANT_MODES:
+    """Resolve aliases (e.g. 'dynamic' → 'W8A8') and validate."""
+    raw_mode = mode.strip()
+
+    # Accept canonical names in any case (e.g., "w8a8" -> "W8A8")
+    upper_mode = raw_mode.upper()
+    if upper_mode in QUANT_MODES:
+        return upper_mode
+
+    # Resolve aliases in lower case
+    resolved_mode = _ALIASES.get(raw_mode.lower(), raw_mode)
+
+    if resolved_mode not in QUANT_MODES:
         raise ValueError(
             f"Unknown mode '{mode}'. Choose from: {list(QUANT_MODES.keys())}"
         )
-    return mode
+    return resolved_mode
 
 
 def quantize_model(

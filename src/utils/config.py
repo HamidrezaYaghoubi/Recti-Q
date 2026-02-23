@@ -71,9 +71,21 @@ class DatasetConfig:
 
 @dataclass
 class QuantizationConfig:
-    """Configuration for torchao INT8 quantization."""
+    """Configuration for quantization workflows."""
     enabled: bool = False
     modes: List[str] = field(default_factory=lambda: ["weight_only"])
+    # YOLO export-based quantization options
+    yolo_format: Optional[str] = None
+    yolo_data: Optional[str] = None
+    yolo_fraction: float = 1.0
+    yolo_imgsz: int = 640
+    yolo_batch: int = 8
+    yolo_export_dir: Optional[str] = None
+    reuse_yolo_export: bool = True
+    # Optional explicit calibration budgeting for YOLO export INT8.
+    # Precedence in main.py: num_calibration_batches > calibration_num_samples > yolo_fraction.
+    num_calibration_batches: Optional[int] = None
+    calibration_num_samples: Optional[int] = None
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QuantizationConfig":
@@ -81,9 +93,25 @@ class QuantizationConfig:
         modes = data.get("modes", ["weight_only"])
         if isinstance(modes, str):
             modes = [modes]
+        calibration = data.get("calibration") or {}
+        num_calib_batches = data.get("num_calibration_batches")
+        calib_num_samples = calibration.get("num_samples")
         return cls(
             enabled=data.get("enabled", False),
             modes=modes,
+            yolo_format=data.get("yolo_format"),
+            yolo_data=data.get("yolo_data"),
+            yolo_fraction=float(data.get("yolo_fraction", 1.0)),
+            yolo_imgsz=int(data.get("yolo_imgsz", 640)),
+            yolo_batch=int(data.get("yolo_batch", 8)),
+            yolo_export_dir=data.get("yolo_export_dir"),
+            reuse_yolo_export=bool(data.get("reuse_yolo_export", True)),
+            num_calibration_batches=(
+                int(num_calib_batches) if num_calib_batches is not None else None
+            ),
+            calibration_num_samples=(
+                int(calib_num_samples) if calib_num_samples is not None else None
+            ),
         )
 
 
@@ -139,7 +167,7 @@ class OutputConfig:
     save_confidence: bool = True
     save_boxes: bool = False  # For detection
     save_scores: bool = False  # For detection
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OutputConfig":
         """Create OutputConfig from dictionary."""

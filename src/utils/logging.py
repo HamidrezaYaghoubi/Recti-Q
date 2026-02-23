@@ -8,7 +8,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 try:
     import wandb
@@ -128,6 +128,11 @@ class WandbLogger:
         config: ExperimentConfig,
         resume: bool = False,
         run_id: Optional[str] = None,
+        run_name: Optional[str] = None,
+        run_group: Optional[str] = None,
+        run_job_type: Optional[str] = None,
+        extra_tags: Optional[List[str]] = None,
+        extra_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize wandb logging.
@@ -136,6 +141,11 @@ class WandbLogger:
             config: Experiment configuration.
             resume: Whether to resume a previous run.
             run_id: Specific run ID to resume.
+            run_name: Optional explicit run name.
+            run_group: Optional wandb run group.
+            run_job_type: Optional wandb job type.
+            extra_tags: Optional tags appended to base config tags.
+            extra_config: Optional key-values merged into wandb config.
         """
         self.config = config
         self.enabled = config.logging.wandb.enabled and WANDB_AVAILABLE
@@ -148,9 +158,26 @@ class WandbLogger:
             )
         
         if self.enabled:
-            self._init_wandb(resume, run_id)
+            self._init_wandb(
+                resume=resume,
+                run_id=run_id,
+                run_name=run_name,
+                run_group=run_group,
+                run_job_type=run_job_type,
+                extra_tags=extra_tags,
+                extra_config=extra_config,
+            )
     
-    def _init_wandb(self, resume: bool, run_id: Optional[str]) -> None:
+    def _init_wandb(
+        self,
+        resume: bool,
+        run_id: Optional[str],
+        run_name: Optional[str],
+        run_group: Optional[str],
+        run_job_type: Optional[str],
+        extra_tags: Optional[List[str]],
+        extra_config: Optional[Dict[str, Any]],
+    ) -> None:
         """Initialize wandb run."""
         wandb_config = self.config.logging.wandb
         
@@ -163,16 +190,27 @@ class WandbLogger:
             "datasets": list(self.config.datasets.keys()),
             "quantization_enabled": self.config.quantization.enabled,
         }
+        if extra_config:
+            config_dict.update(extra_config)
+
+        tags = list(wandb_config.tags)
+        if extra_tags:
+            for tag in extra_tags:
+                if tag not in tags:
+                    tags.append(tag)
         
         self._run = wandb.init(
             project=wandb_config.project,
             entity=wandb_config.entity,
-            name=self.config.name,
+            name=run_name or self.config.name,
+            group=run_group,
+            job_type=run_job_type,
             config=config_dict,
-            tags=wandb_config.tags,
+            tags=tags,
             notes=wandb_config.notes,
             resume="allow" if resume else None,
             id=run_id,
+            reinit=True,
         )
         
         self._logger.info(f"Initialized wandb run: {self._run.name}")
@@ -264,6 +302,7 @@ class WandbLogger:
         if self.enabled and self._run is not None:
             self._run.finish()
             self._logger.info("Finished wandb run")
+            self._run = None
     
     @property
     def run(self):
