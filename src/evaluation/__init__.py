@@ -14,6 +14,9 @@ from src.evaluation.detection_metrics import (
     COCOEvaluator,
     remap_yolo_to_coco_labels,
 )
+from src.evaluation.detection_drift import (
+    compute_detection_quantization_drift,
+)
 
 __all__ = [
     "compute_accuracy",
@@ -23,5 +26,5 @@ __all__ = [
     "compute_coco_metrics",
     "COCOEvaluator",
     "remap_yolo_to_coco_labels",
+    "compute_detection_quantization_drift",
 ]
-

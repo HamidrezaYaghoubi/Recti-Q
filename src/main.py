@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Any, Tuple
 
 import torch
@@ -592,6 +593,69 @@ def evaluate_model_on_coco(
 # ========================================================================
 # Quantized evaluation helpers
 # ========================================================================
+
+def evaluate_detection_quantization_drift(
+    fp32_model: Any,
+    quantized_model: Any,
+    config: ExperimentConfig,
+    logger: MetricsLogger,
+    text_logger,
+    precision_label: str,
+) -> Dict[str, float]:
+    """
+    Compute FP32-vs-quantized detection drift on COCO and log to wandb.
+
+    This is an output-level comparison (decision drift), not mAP.
+    """
+    from src.datasets import get_coco_loader
+    from src.evaluation import compute_detection_quantization_drift
+
+    dataset_config = config.get_dataset("coco")
+    dataloader = get_coco_loader(
+        config=dataset_config,
+        task="detection",
+        num_workers=config.num_workers,
+        debug=config.debug,
+        debug_samples=config.debug_samples,
+    )
+
+    model_name = str(getattr(fp32_model, "name", "model"))
+    text_logger.info(f"  Computing decision drift on COCO [{precision_label}]...")
+    drift_all = compute_detection_quantization_drift(
+        fp32_model=fp32_model,
+        quantized_model=quantized_model,
+        dataloader=dataloader,
+        device=config.device,
+        description=f"Drift - {model_name} [{precision_label}]",
+    )
+
+    keys = [
+        "miss_rate",
+        "hallucination_rate",
+        "class_flip_rate",
+        "score_drift",
+        "box_drift",
+        "gt_conditioned_miss_rate",
+    ]
+    drift_metrics = {k: float(drift_all[k]) for k in keys}
+
+    drift_prefix = f"{model_name}/quantization_drift"
+    logger.log({f"{drift_prefix}/{k}": v for k, v in drift_metrics.items()})
+
+    if getattr(logger, "wandb_logger", None) is not None:
+        logger.wandb_logger.log_summary(drift_metrics)
+
+    text_logger.info(
+        "  Decision drift summary: "
+        f"miss={drift_metrics['miss_rate']:.4f}, "
+        f"hallucination={drift_metrics['hallucination_rate']:.4f}, "
+        f"class_flip={drift_metrics['class_flip_rate']:.4f}, "
+        f"score_drift={drift_metrics['score_drift']:.4f}, "
+        f"box_drift={drift_metrics['box_drift']:.4f}, "
+        f"gt_cond_miss={drift_metrics['gt_conditioned_miss_rate']:.4f}"
+    )
+
+    return drift_metrics
 
 def evaluate_quantized_classification(
     model: BaseModel,
@@ -1467,6 +1531,33 @@ def evaluate_quantized_yolo_detection(
     finally:
         model.backbone = original_backbone
 
+    if config.quantization.compute_detection_drift:
+        fp32_view = SimpleNamespace(
+            name=model.name,
+            backbone=original_backbone,
+            _yolo=getattr(model, "_yolo", None),
+        )
+        quant_view = SimpleNamespace(
+            name=model.name,
+            backbone=quantized_backbone,
+            _yolo=getattr(model, "_yolo", None),
+        )
+        drift_metrics = evaluate_detection_quantization_drift(
+            fp32_model=fp32_view,
+            quantized_model=quant_view,
+            config=config,
+            logger=logger,
+            text_logger=text_logger,
+            precision_label=precision_label,
+        )
+        for k, v in drift_metrics.items():
+            q_stats[f"drift_{k}"] = float(v)
+    else:
+        text_logger.info(
+            f"  Skipping decision drift metrics for {model.name} [{precision_label}] "
+            "(quantization.compute_detection_drift=false)"
+        )
+
     return metrics, q_stats, precision_label
 
 
@@ -1526,6 +1617,25 @@ def evaluate_quantized_detection(
         )
     finally:
         model.backbone = original_module
+
+    if config.quantization.compute_detection_drift:
+        fp32_view = SimpleNamespace(name=model.name, backbone=original_module)
+        quant_view = SimpleNamespace(name=model.name, backbone=q_module)
+        drift_metrics = evaluate_detection_quantization_drift(
+            fp32_model=fp32_view,
+            quantized_model=quant_view,
+            config=config,
+            logger=logger,
+            text_logger=text_logger,
+            precision_label=mode,
+        )
+        for k, v in drift_metrics.items():
+            q_stats[f"drift_{k}"] = float(v)
+    else:
+        text_logger.info(
+            f"  Skipping decision drift metrics for {model.name} [{mode}] "
+            "(quantization.compute_detection_drift=false)"
+        )
 
     # Free quantized model
     del q_module

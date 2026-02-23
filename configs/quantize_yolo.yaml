@@ -52,6 +52,7 @@ quantization:
   yolo_batch: 8
   yolo_export_dir: "./results/yolo_exports"
   reuse_yolo_export: true
+  compute_detection_drift: true
   num_calibration_batches: 50
   calibration:
     num_samples: null

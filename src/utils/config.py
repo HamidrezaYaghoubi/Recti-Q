@@ -82,6 +82,8 @@ class QuantizationConfig:
     yolo_batch: int = 8
     yolo_export_dir: Optional[str] = None
     reuse_yolo_export: bool = True
+    # Output-level FP32-vs-quantized drift analysis for detection tasks.
+    compute_detection_drift: bool = True
     # Optional explicit calibration budgeting for YOLO export INT8.
     # Precedence in main.py: num_calibration_batches > calibration_num_samples > yolo_fraction.
     num_calibration_batches: Optional[int] = None
@@ -106,6 +108,7 @@ class QuantizationConfig:
             yolo_batch=int(data.get("yolo_batch", 8)),
             yolo_export_dir=data.get("yolo_export_dir"),
             reuse_yolo_export=bool(data.get("reuse_yolo_export", True)),
+            compute_detection_drift=bool(data.get("compute_detection_drift", True)),
             num_calibration_batches=(
                 int(num_calib_batches) if num_calib_batches is not None else None
             ),
