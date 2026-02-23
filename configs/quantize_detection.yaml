@@ -1,7 +1,5 @@
 # INT8 Quantization – Detection Models (Torchvision)
-# Runs FP32 baseline + INT8 dynamic for each model on COCO
-# Static quantization for detection is more complex (no simple forward pass)
-# so we start with dynamic only.
+# Runs FP32 baseline + torchao quantized variants for each model on COCO.
 
 experiment:
   name: "quantize_detection"
@@ -39,7 +37,8 @@ datasets:
 
 quantization:
   enabled: true
-  modes: ["dynamic"]              # Dynamic only for detection (safer)
+  # Default safe mode. INT4 (W4A16) needs fbgemm-gpu-genai >= 1.2.0.
+  modes: ["W8A8"]
   precision: ["int8"]
   backend: "x86"
   per_channel: true
