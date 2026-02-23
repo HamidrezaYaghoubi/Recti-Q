@@ -306,6 +306,13 @@ def format_quantization_stats(
     compress = stats.get("compression_ratio", 0)
     reduction = stats.get("size_reduction_pct", 0)
     q_time = stats.get("quantization_time_s", 0)
+    calibration_source = stats.get("calibration_source")
+    calibration_fraction = stats.get("calibration_fraction")
+    total_layers = stats.get("total_layers")
+    int8_layers = stats.get("int8_layers")
+    fallback_layers = stats.get("fallback_layers")
+    int8_ratio = stats.get("int8_ratio")
+    fallback_ratio = stats.get("fallback_ratio")
     mode_desc = stats.get("mode_description", mode)
     target = stats.get("target_layers", "nn.Linear")
 
@@ -325,15 +332,33 @@ def format_quantization_stats(
         f"│ Compression:      {compress:>25.2f}x │",
         f"│ Size reduction:   {reduction:>24.1f} % │",
         f"│ Quant time:       {q_time:>24.1f} s │",
-        f"├{'─' * 50}┤",
-        f"│ Original layers:                                 │",
-        f"│   Linear:  {orig_layers.get('Linear', 0):>35d}  │",
-        f"│   Conv2d:  {orig_layers.get('Conv2d', 0):>35d}  │",
-        f"│ After quantization:                              │",
-        f"│   Linear:  {quant_layers.get('Linear', 0):>35d}  │",
-        f"│   Conv2d:  {quant_layers.get('Conv2d', 0):>35d}  │",
-        f"└{'─' * 50}┘",
     ]
+
+    if int8_layers is not None and total_layers is not None:
+        lines.append(f"│ INT8 layers:      {f'{int8_layers}/{total_layers}':>25} │")
+    if int8_ratio is not None:
+        lines.append(f"│ INT8 coverage:    {float(int8_ratio) * 100:>24.1f} % │")
+    if fallback_layers is not None and total_layers is not None:
+        lines.append(f"│ Fallback layers:  {f'{fallback_layers}/{total_layers}':>25} │")
+    if fallback_ratio is not None:
+        lines.append(f"│ Fallback ratio:   {float(fallback_ratio) * 100:>24.1f} % │")
+    if calibration_source is not None:
+        lines.append(f"│ Calib source:     {str(calibration_source):>25} │")
+    if calibration_fraction is not None:
+        lines.append(f"│ Calib fraction:   {float(calibration_fraction):>24.4f} │")
+
+    lines.extend(
+        [
+            f"├{'─' * 50}┤",
+            f"│ Original layers:                                 │",
+            f"│   Linear:  {orig_layers.get('Linear', 0):>35d}  │",
+            f"│   Conv2d:  {orig_layers.get('Conv2d', 0):>35d}  │",
+            f"│ After quantization:                              │",
+            f"│   Linear:  {quant_layers.get('Linear', 0):>35d}  │",
+            f"│   Conv2d:  {quant_layers.get('Conv2d', 0):>35d}  │",
+            f"└{'─' * 50}┘",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -361,14 +386,15 @@ def format_comparison_row(
     Returns:
         Formatted comparison string.
     """
+    precision_label = quant_mode.upper()
     lines = [
         f"┌{'─' * 64}┐",
-        f"│ {'FP32 vs INT8 ' + quant_mode.upper() + ' Comparison':^62} │",
+        f"│ {('FP32 vs ' + precision_label + ' Comparison'):^62} │",
         f"├{'─' * 64}┤",
         f"│ Model:    {model_name:<52} │",
         f"│ Dataset:  {dataset_name:<52} │",
         f"├{'─' * 25}┬{'─' * 18}┬{'─' * 18}┤",
-        f"│ {'Metric':<23} │ {'FP32':^16} │ {'INT8 '+quant_mode:^16} │",
+        f"│ {'Metric':<23} │ {'FP32':^16} │ {precision_label:^16} │",
         f"├{'─' * 25}┼{'─' * 18}┼{'─' * 18}┤",
     ]
 

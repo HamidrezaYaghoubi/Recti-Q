@@ -313,7 +313,7 @@ class CheckpointManager:
         
         self._logger.info(f"Saved metrics: {output_path}")
         return output_path
-    
+
     def get_latest_checkpoint(
         self,
         model_name: Optional[str] = None,

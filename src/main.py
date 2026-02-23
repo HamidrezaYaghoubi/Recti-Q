@@ -13,9 +13,15 @@ Usage:
 """
 
 import argparse
+import importlib.util
+import json
+import os
+import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Any, Tuple
 
 import torch
@@ -41,7 +47,11 @@ from src.utils.formatting import (
 from src.models import ModelFactory, BaseModel
 from src.datasets import get_imagenet_loader, get_imagenet_c_loader, get_all_imagenet_c_loaders
 from src.evaluation import MetricsComputer, ClassificationMetrics
-from src.quantization import quantize_model, QUANT_MODES
+from src.quantization import quantize_model, QUANT_MODES, resolve_mode, get_model_size_mb
+
+
+class QuantizationSkipped(RuntimeError):
+    """Raised when a quantization run is skipped due to environment/backend limits."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -394,6 +404,7 @@ def evaluate_model_on_coco(
     checkpoint_manager: CheckpointManager,
     logger: MetricsLogger,
     text_logger,
+    precision: str = "fp32",
 ) -> Dict[str, Any]:
     """
     Evaluate a detection model on COCO dataset with proper mAP computation.
@@ -404,6 +415,7 @@ def evaluate_model_on_coco(
         checkpoint_manager: Checkpoint manager.
         logger: Metrics logger.
         text_logger: Text logger.
+        precision: Precision label for logging/saving (e.g. "fp32", "W8A8").
         
     Returns:
         Dictionary with detection metrics (mAP, mAP50, mAP75, etc.).
@@ -414,11 +426,10 @@ def evaluate_model_on_coco(
     from src.evaluation import COCOEvaluator, remap_yolo_to_coco_labels
     from pycocotools.coco import COCO
     
-    text_logger.info(f"  Evaluating on COCO val2017...")
+    text_logger.info(f"  Evaluating on COCO val2017 [{precision}]...")
     
     # Get dataset config
     dataset_config = config.get_dataset("coco")
-    
     # Load COCO ground truth annotations (suppress verbose output)
     ann_file = Path(dataset_config.root) / "annotations" / "instances_val2017.json"
     old_stdout = sys.stdout
@@ -516,23 +527,48 @@ def evaluate_model_on_coco(
         model_name=model.name,
         dataset_name="COCO val2017",
         metrics=metrics,
-        precision="fp32",
+        precision=precision,
         verbose=True,  # Show size breakdown
     )
     print("\n" + formatted)
-    
-    # Log to wandb
-    logger.log({
-        f"{model.name}/coco/mAP": metrics["mAP"],
-        f"{model.name}/coco/mAP50": metrics["mAP50"],
-        f"{model.name}/coco/mAP75": metrics["mAP75"],
-        f"{model.name}/coco/mAP_small": metrics["mAP_small"],
-        f"{model.name}/coco/mAP_medium": metrics["mAP_medium"],
-        f"{model.name}/coco/mAP_large": metrics["mAP_large"],
-        f"{model.name}/coco/AR_100": metrics["AR_100"],
-        f"{model.name}/coco/num_images": metrics["num_images"],
-        f"{model.name}/coco/total_detections": metrics["total_detections"],
-    })
+
+    # Log to wandb.
+    # Each precision is now its own run, so keep metric keys identical across
+    # runs to make FP32 vs INT8 comparisons straightforward in wandb UI.
+    wandb_prefix = f"{model.name}/coco"
+    coco_log_metrics = {
+        # Existing keys (kept for backward compatibility)
+        f"{wandb_prefix}/mAP": metrics["mAP"],
+        f"{wandb_prefix}/mAP50": metrics["mAP50"],
+        f"{wandb_prefix}/mAP75": metrics["mAP75"],
+        f"{wandb_prefix}/mAP_small": metrics["mAP_small"],
+        f"{wandb_prefix}/mAP_medium": metrics["mAP_medium"],
+        f"{wandb_prefix}/mAP_large": metrics["mAP_large"],
+        f"{wandb_prefix}/AR_100": metrics["AR_100"],
+        # Canonical aliases for cleaner panel naming
+        f"{wandb_prefix}/map": metrics["mAP"],
+        f"{wandb_prefix}/map_50": metrics["mAP50"],
+        f"{wandb_prefix}/map75": metrics["mAP75"],
+        f"{wandb_prefix}/map_small": metrics["mAP_small"],
+        f"{wandb_prefix}/map_medium": metrics["mAP_medium"],
+        f"{wandb_prefix}/map_large": metrics["mAP_large"],
+        f"{wandb_prefix}/ar_100": metrics["AR_100"],
+    }
+    logger.log(coco_log_metrics)
+
+    # Also write concise summary keys for run-table comparison.
+    if getattr(logger, "wandb_logger", None) is not None:
+        logger.wandb_logger.log_summary(
+            {
+                "map": metrics["mAP"],
+                "map_50": metrics["mAP50"],
+                "map75": metrics["mAP75"],
+                "map_small": metrics["mAP_small"],
+                "map_medium": metrics["mAP_medium"],
+                "map_large": metrics["mAP_large"],
+                "ar_100": metrics["AR_100"],
+            }
+        )
     
     # Save predictions
     if config.output.save_predictions:
@@ -540,7 +576,7 @@ def evaluate_model_on_coco(
             predictions={"predictions": all_predictions, "targets": all_targets, "metrics": metrics},
             model_name=model.name,
             dataset_name="coco",
-            precision="fp32",
+            precision=precision,
         )
     
     # Save metrics
@@ -548,7 +584,7 @@ def evaluate_model_on_coco(
         metrics=metrics,
         model_name=model.name,
         dataset_name="coco",
-        precision="fp32",
+        precision=precision,
     )
     
     return metrics
@@ -557,6 +593,69 @@ def evaluate_model_on_coco(
 # ========================================================================
 # Quantized evaluation helpers
 # ========================================================================
+
+def evaluate_detection_quantization_drift(
+    fp32_model: Any,
+    quantized_model: Any,
+    config: ExperimentConfig,
+    logger: MetricsLogger,
+    text_logger,
+    precision_label: str,
+) -> Dict[str, float]:
+    """
+    Compute FP32-vs-quantized detection drift on COCO and log to wandb.
+
+    This is an output-level comparison (decision drift), not mAP.
+    """
+    from src.datasets import get_coco_loader
+    from src.evaluation import compute_detection_quantization_drift
+
+    dataset_config = config.get_dataset("coco")
+    dataloader = get_coco_loader(
+        config=dataset_config,
+        task="detection",
+        num_workers=config.num_workers,
+        debug=config.debug,
+        debug_samples=config.debug_samples,
+    )
+
+    model_name = str(getattr(fp32_model, "name", "model"))
+    text_logger.info(f"  Computing decision drift on COCO [{precision_label}]...")
+    drift_all = compute_detection_quantization_drift(
+        fp32_model=fp32_model,
+        quantized_model=quantized_model,
+        dataloader=dataloader,
+        device=config.device,
+        description=f"Drift - {model_name} [{precision_label}]",
+    )
+
+    keys = [
+        "miss_rate",
+        "hallucination_rate",
+        "class_flip_rate",
+        "score_drift",
+        "box_drift",
+        "gt_conditioned_miss_rate",
+    ]
+    drift_metrics = {k: float(drift_all[k]) for k in keys}
+
+    drift_prefix = f"{model_name}/quantization_drift"
+    logger.log({f"{drift_prefix}/{k}": v for k, v in drift_metrics.items()})
+
+    if getattr(logger, "wandb_logger", None) is not None:
+        logger.wandb_logger.log_summary(drift_metrics)
+
+    text_logger.info(
+        "  Decision drift summary: "
+        f"miss={drift_metrics['miss_rate']:.4f}, "
+        f"hallucination={drift_metrics['hallucination_rate']:.4f}, "
+        f"class_flip={drift_metrics['class_flip_rate']:.4f}, "
+        f"score_drift={drift_metrics['score_drift']:.4f}, "
+        f"box_drift={drift_metrics['box_drift']:.4f}, "
+        f"gt_cond_miss={drift_metrics['gt_conditioned_miss_rate']:.4f}"
+    )
+
+    return drift_metrics
 
 def evaluate_quantized_classification(
     model: BaseModel,
@@ -577,11 +676,13 @@ def evaluate_quantized_classification(
         checkpoint_manager: For saving results.
         logger: Metrics logger.
         text_logger: Text logger.
-        mode: 'weight_only' or 'weight_and_activation'.
+        mode: One of QUANT_MODES keys ('W8A16', 'W8A8', 'W4A16', etc.).
 
     Returns:
         (ClassificationMetrics, quantization_stats_dict)
     """
+    mode = resolve_mode(mode)  # handle aliases
+
     # ── Quantize the backbone ──
     text_logger.info(f"  Quantizing {model.name} – {mode}...")
     q_backbone, q_stats = quantize_model(
@@ -599,7 +700,7 @@ def evaluate_quantized_classification(
     print("\n" + stats_fmt)
 
     # ── Evaluate on ImageNet ──
-    text_logger.info(f"  Evaluating INT8 {mode} on ImageNet (GPU)...")
+    text_logger.info(f"  Evaluating {mode} on ImageNet (GPU)...")
 
     dataset_config = config.get_dataset("imagenet")
     dataloader = get_imagenet_loader(
@@ -620,51 +721,1097 @@ def evaluate_quantized_classification(
             dataloader=dataloader,
             device=config.device,
             logger=logger,
-            description=f"ImageNet - {model.name} [INT8 {mode}]",
+            description=f"ImageNet - {model.name} [{mode}]",
         )
     finally:
         # Restore original backbone
         model.backbone = original_backbone
 
     metrics = results["metrics"]
-    precision_tag = f"int8_{mode}"
 
     # Print results
     formatted = format_classification_results(
         model_name=model.name,
         dataset_name="ImageNet",
         metrics=metrics,
-        precision=precision_tag,
+        precision=mode,
     )
     print("\n" + formatted)
-
-    # Log
-    logger.log({
-        f"{model.name}/imagenet/{precision_tag}/top1": metrics.top1_accuracy,
-        f"{model.name}/imagenet/{precision_tag}/top5": metrics.top5_accuracy,
-    })
-
-    # Log quantization stats
-    logger.log({
-        f"{model.name}/quantization/{mode}/original_size_mb": q_stats["original_size_mb"],
-        f"{model.name}/quantization/{mode}/quantized_size_mb": q_stats["quantized_size_mb"],
-        f"{model.name}/quantization/{mode}/compression_ratio": q_stats["compression_ratio"],
-        f"{model.name}/quantization/{mode}/size_reduction_pct": q_stats["size_reduction_pct"],
-    })
 
     # Save
     checkpoint_manager.save_metrics(
         metrics=metrics.to_dict(),
         model_name=model.name,
         dataset_name="imagenet",
-        precision=precision_tag,
+        precision=mode,
     )
 
     # Free quantized model
     del q_backbone
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return metrics, q_stats
+
+
+def _is_yolo_model(model: BaseModel) -> bool:
+    """Return True when model is our ultralytics-backed YOLO wrapper."""
+    yolo_obj = getattr(model, "_yolo", None)
+    return yolo_obj is not None and hasattr(yolo_obj, "model")
+
+
+def _get_detection_quant_target(model: BaseModel) -> Tuple[str, torch.nn.Module]:
+    """
+    Return the torch module to quantize for non-YOLO detection models.
+
+    YOLO uses an export-based quantization path, not torchao in-place quantization.
+    """
+    return "backbone", model.backbone
+
+
+def _resolve_yolo_quant_mode(mode: str) -> str:
+    """
+    Resolve YOLO quant mode names.
+
+    Supported:
+      - YOLO_INT8 (canonical)
+      - aliases: int8, yolo_int8, w8a8, w8a16, dynamic, weight_only
+    """
+    mode_key = mode.strip().lower()
+    int8_aliases = {
+        "yolo_int8",
+        "int8",
+        "w8a8",
+        "w8a16",
+        "dynamic",
+        "weight_only",
+        "weight_and_activation",
+    }
+    int4_aliases = {"int4", "w4a16", "w4a8fp"}
+    if mode_key in int8_aliases:
+        return "YOLO_INT8"
+    if mode_key in int4_aliases:
+        raise ValueError(
+            f"YOLO mode '{mode}' is not supported. Ultralytics export path does not provide YOLO INT4."
+        )
+    if mode.strip().upper() == "YOLO_INT8":
+        return "YOLO_INT8"
+    raise ValueError(
+        f"Unknown YOLO quantization mode '{mode}'. Use one of: YOLO_INT8 (or alias int8)."
+    )
+
+
+def _module_available(module_name: str) -> bool:
+    """Return True if a Python module can be imported in this environment."""
+    return importlib.util.find_spec(module_name) is not None
+
+
+def _resolve_yolo_export_format(config: ExperimentConfig) -> str:
+    """
+    Resolve export format for YOLO INT8 and validate backend availability.
+
+    Supported automatic policy:
+      - CUDA device -> engine
+      - CPU device  -> openvino
+    """
+    quant_cfg = config.quantization
+    requested = (quant_cfg.yolo_format or "auto").lower()
+
+    if requested == "auto":
+        requested = "engine" if config.device.startswith("cuda") else "openvino"
+
+    if requested == "openvino" and not _module_available("openvino"):
+        raise QuantizationSkipped(
+            "YOLO INT8 requires OpenVINO for yolo_format='openvino', "
+            "but module 'openvino' is not installed in this environment. "
+            "Install it (`pip install openvino`) or run on a TensorRT GPU node "
+            "with yolo_format='engine'."
+        )
+    if requested == "openvino" and not _module_available("nncf"):
+        raise QuantizationSkipped(
+            "YOLO INT8 OpenVINO export also requires NNCF, but module 'nncf' is not installed. "
+            "Install it (`pip install \"nncf>=2.14.0\"`) and rerun."
+        )
+
+    if requested == "engine":
+        missing = []
+        if not _module_available("onnx"):
+            missing.append("onnx")
+        if not _module_available("onnxslim"):
+            missing.append("onnxslim")
+        # Package is `onnxruntime-gpu`, import name is `onnxruntime`.
+        if not _module_available("onnxruntime"):
+            missing.append("onnxruntime-gpu")
+        if not _module_available("tensorrt"):
+            missing.append("tensorrt")
+        if missing:
+            raise QuantizationSkipped(
+                "YOLO INT8 TensorRT export (yolo_format='engine') is missing required dependencies: "
+                f"{', '.join(missing)}. "
+                "Install them in your env, e.g. "
+                "`pip install \"onnx>=1.12.0,<2.0.0\" onnxslim onnxruntime-gpu tensorrt`."
+            )
+
+    if requested == "engine" and not config.device.startswith("cuda"):
+        raise QuantizationSkipped(
+            "YOLO INT8 TensorRT export (yolo_format='engine') requires CUDA. "
+            "Use a GPU node or set yolo_format='openvino' on CPU with OpenVINO installed."
+        )
+
+    return requested
+
+
+def _get_path_size_mb(path: Path) -> float:
+    """Compute total size in MB for a file or directory."""
+    if path.is_file():
+        return path.stat().st_size / (1024 ** 2)
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            total += p.stat().st_size
+    return total / (1024 ** 2)
+
+
+def _count_images_from_yolo_split(split_value: Any) -> int:
+    """
+    Count image entries from a YOLO split value (path/list/txt/glob).
+    """
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+    if isinstance(split_value, (list, tuple)):
+        return sum(_count_images_from_yolo_split(v) for v in split_value)
+
+    split_path = Path(str(split_value))
+    if split_path.is_file():
+        if split_path.suffix.lower() == ".txt":
+            with open(split_path, "r") as f:
+                return sum(1 for line in f if line.strip())
+        return 1 if split_path.suffix.lower() in image_exts else 0
+
+    if split_path.is_dir():
+        return sum(1 for p in split_path.rglob("*") if p.is_file() and p.suffix.lower() in image_exts)
+
+    split_str = str(split_value)
+    if any(ch in split_str for ch in "*?[]"):
+        parent = Path(".")
+        pattern = split_str
+        if "/" in split_str:
+            parent = Path(split_str).parent
+            pattern = Path(split_str).name
+        if parent.exists():
+            return sum(
+                1
+                for p in parent.glob(pattern)
+                if p.is_file() and p.suffix.lower() in image_exts
+            )
+
+    return 0
+
+
+def _count_yolo_calibration_images(data_arg: str, split: str = "val") -> Optional[int]:
+    """
+    Return total number of images available for YOLO INT8 calibration split.
+    """
+    try:
+        from ultralytics.data.utils import check_det_dataset
+    except Exception:
+        return None
+
+    try:
+        data = check_det_dataset(data_arg)
+        split_value = data.get(split) or data.get("val")
+        if split_value is None:
+            return None
+        total = _count_images_from_yolo_split(split_value)
+        return total if total > 0 else None
+    except Exception:
+        return None
+
+
+def _resolve_yolo_calibration_fraction(
+    quant_cfg,
+    data_arg: str,
+    text_logger,
+) -> Tuple[float, str, Optional[int], Optional[int]]:
+    """
+    Resolve calibration amount for YOLO export.
+
+    Precedence:
+      1) quantization.num_calibration_batches
+      2) quantization.calibration.num_samples
+      3) quantization.yolo_fraction
+    """
+    base_fraction = float(quant_cfg.yolo_fraction)
+    base_fraction = min(max(base_fraction, 1e-6), 1.0)
+
+    total_images = _count_yolo_calibration_images(data_arg, split="val")
+    num_batches = quant_cfg.num_calibration_batches
+    num_samples = quant_cfg.calibration_num_samples
+
+    if num_batches is not None and num_batches <= 0:
+        text_logger.warning(
+            f"  [!] Ignoring num_calibration_batches={num_batches}; expected positive integer."
+        )
+        num_batches = None
+    if num_samples is not None and num_samples <= 0:
+        text_logger.warning(
+            f"  [!] Ignoring calibration.num_samples={num_samples}; expected positive integer."
+        )
+        num_samples = None
+
+    if num_batches is not None and num_samples is not None:
+        text_logger.info(
+            "  Calibration precedence: using num_calibration_batches "
+            "(calibration.num_samples ignored for this run)."
+        )
+
+    if num_batches is not None:
+        target_images = int(num_batches) * int(quant_cfg.yolo_batch)
+        if total_images is not None:
+            eff_fraction = min(max(target_images / max(total_images, 1), 1e-6), 1.0)
+        else:
+            eff_fraction = base_fraction
+            text_logger.warning(
+                "  [!] Could not determine dataset size for num_calibration_batches; "
+                f"falling back to yolo_fraction={base_fraction:.4f}."
+            )
+        return eff_fraction, "num_calibration_batches", target_images, total_images
+
+    if num_samples is not None:
+        target_images = int(num_samples)
+        if total_images is not None:
+            eff_fraction = min(max(target_images / max(total_images, 1), 1e-6), 1.0)
+        else:
+            eff_fraction = base_fraction
+            text_logger.warning(
+                "  [!] Could not determine dataset size for calibration.num_samples; "
+                f"falling back to yolo_fraction={base_fraction:.4f}."
+            )
+        return eff_fraction, "calibration.num_samples", target_images, total_images
+
+    target_images = int(round(base_fraction * total_images)) if total_images is not None else None
+    return base_fraction, "yolo_fraction", target_images, total_images
+
+
+def _normalize_cache_path(path_like: str) -> str:
+    """Return a stable absolute path string when possible."""
+    p = Path(str(path_like))
+    try:
+        if p.exists():
+            return str(p.resolve())
+    except Exception:
+        pass
+    return str(path_like)
+
+
+def _build_yolo_export_cache_key(
+    config: ExperimentConfig,
+    model_name: str,
+    canonical_mode: str,
+    export_format: str,
+    data_arg: str,
+    quant_cfg,
+    calib_fraction: float,
+    calib_source: str,
+) -> Dict[str, Any]:
+    """
+    Build a deterministic cache key for reusable YOLO exports.
+    """
+    key = {
+        "key_version": 1,
+        "seed": int(config.seed),
+        "model_name": model_name,
+        "mode": canonical_mode,
+        "format": export_format,
+        "device": config.device,
+        "data": _normalize_cache_path(data_arg),
+        "imgsz": int(quant_cfg.yolo_imgsz),
+        "batch": int(quant_cfg.yolo_batch),
+        "fraction": round(float(calib_fraction), 8),
+        "calibration_source": str(calib_source),
+        "dynamic": bool(export_format == "engine"),
+    }
+    return key
+
+
+def _load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    """Load JSON file safely."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_json_file(path: Path, payload: Dict[str, Any]) -> None:
+    """Save JSON payload atomically-ish for cache metadata."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    tmp.replace(path)
+
+
+def _yolo_export_manifest_path(export_dir: Path) -> Path:
+    """Manifest path for reusable YOLO export metadata."""
+    return export_dir / "qda_export_manifest.json"
+
+
+def _relocate_yolo_export_artifacts(
+    exported_path: Path,
+    export_root: Path,
+    export_name: str,
+    text_logger,
+) -> Path:
+    """
+    Move YOLO export artifacts (engine/onnx/cache) into a clean export subdirectory.
+
+    Ultralytics TensorRT export writes files beside model weights, which may be the repo
+    root. We relocate files with the same stem as exported_path for cleaner outputs.
+    """
+    if not exported_path.exists():
+        return exported_path
+
+    target_dir = (export_root / export_name).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    src_dir = exported_path.parent.resolve()
+    if src_dir == target_dir:
+        return exported_path
+
+    stem = exported_path.stem
+    movable_suffixes = {".engine", ".onnx", ".cache"}
+    moved_files = []
+
+    for file_path in src_dir.iterdir():
+        if not file_path.is_file():
+            continue
+        if file_path.stem != stem:
+            continue
+        if file_path.suffix.lower() not in movable_suffixes:
+            continue
+
+        dest = target_dir / file_path.name
+        if dest.exists():
+            dest.unlink()
+        shutil.move(str(file_path), str(dest))
+        moved_files.append(dest.name)
+
+    relocated = target_dir / exported_path.name
+    if relocated.exists():
+        if moved_files:
+            text_logger.info(
+                f"  Moved YOLO export artifacts to {target_dir}: {', '.join(sorted(moved_files))}"
+            )
+        return relocated
+
+    # Fallback: move exported file even if suffix filtering missed it.
+    dest = target_dir / exported_path.name
+    if dest.exists():
+        dest.unlink()
+    shutil.move(str(exported_path), str(dest))
+    moved_files.append(dest.name)
+    text_logger.info(
+        f"  Moved YOLO export artifacts to {target_dir}: {', '.join(sorted(moved_files))}"
+    )
+    return dest
+
+
+def _strip_ultralytics_engine_header(engine_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
+    """
+    Split Ultralytics .engine files into raw TensorRT payload and metadata.
+
+    Ultralytics prepends [4-byte metadata length][JSON metadata] before TRT bytes.
+    """
+    if len(engine_bytes) < 4:
+        return engine_bytes, {}
+
+    try:
+        meta_len = int.from_bytes(engine_bytes[:4], byteorder="little")
+        header_end = 4 + meta_len
+        if meta_len <= 0 or header_end >= len(engine_bytes):
+            return engine_bytes, {}
+        metadata = json.loads(engine_bytes[4:header_end].decode("utf-8"))
+        if isinstance(metadata, dict):
+            return engine_bytes[header_end:], metadata
+    except Exception:
+        pass
+
+    return engine_bytes, {}
+
+
+def _layer_has_int8_tag(layer_info: Any) -> bool:
+    """Return True when TensorRT layer inspector output contains any INT8 marker."""
+    try:
+        layer_text = json.dumps(layer_info, default=str).upper()
+    except Exception:
+        layer_text = str(layer_info).upper()
+    return "INT8" in layer_text
+
+
+def _collect_tensorrt_int8_coverage(engine_path: Path) -> Dict[str, Any]:
+    """
+    Inspect a TensorRT engine and estimate how many layers carry INT8 tags.
+    """
+    coverage: Dict[str, Any] = {
+        "coverage_available": False,
+        "coverage_error": None,
+    }
+
+    try:
+        import tensorrt as trt
+    except Exception as e:
+        coverage["coverage_error"] = f"TensorRT import failed: {e}"
+        return coverage
+
+    try:
+        raw_bytes = engine_path.read_bytes()
+        payload, metadata = _strip_ultralytics_engine_header(raw_bytes)
+        header_bytes = len(raw_bytes) - len(payload)
+
+        logger = trt.Logger(trt.Logger.ERROR)
+        with trt.Runtime(logger) as runtime:
+            engine = runtime.deserialize_cuda_engine(payload)
+        if engine is None:
+            coverage["coverage_error"] = "deserialize_cuda_engine() returned None"
+            return coverage
+
+        if not hasattr(trt, "LayerInformationFormat") or not hasattr(trt.LayerInformationFormat, "JSON"):
+            coverage["coverage_error"] = "TensorRT JSON inspector format not available"
+            return coverage
+
+        inspector = engine.create_engine_inspector()
+        info_json = inspector.get_engine_information(trt.LayerInformationFormat.JSON)
+        parsed = json.loads(info_json)
+        layers = parsed.get("Layers", []) if isinstance(parsed, dict) else []
+
+        total_layers = len(layers)
+        int8_layers = sum(1 for layer in layers if _layer_has_int8_tag(layer))
+        fallback_layers = max(total_layers - int8_layers, 0)
+        int8_ratio = (int8_layers / total_layers) if total_layers else 0.0
+        fallback_ratio = (fallback_layers / total_layers) if total_layers else 0.0
+
+        coverage.update(
+            {
+                "coverage_available": True,
+                "coverage_error": None,
+                "total_layers": total_layers,
+                "int8_layers": int8_layers,
+                "fallback_layers": fallback_layers,
+                "int8_ratio": int8_ratio,
+                "fallback_ratio": fallback_ratio,
+                "engine_header_detected": bool(metadata),
+                "engine_header_bytes": header_bytes,
+            }
+        )
+    except Exception as e:
+        coverage["coverage_error"] = str(e)
+
+    return coverage
+
+
+def _build_yolo_data_yaml(config: ExperimentConfig) -> Path:
+    """
+    Build a local COCO-style dataset yaml for YOLO export INT8 calibration.
+    """
+    import yaml
+
+    dataset_cfg = config.get_dataset("coco")
+    coco_root = Path(dataset_cfg.root).resolve()
+
+    def _find_split_rel(split_name: str) -> Optional[str]:
+        candidates = [split_name, f"images/{split_name}"]
+        for rel in candidates:
+            if (coco_root / rel).exists():
+                return rel
+        return None
+
+    val_split = dataset_cfg.split or "val2017"
+    val_rel = _find_split_rel(val_split)
+    if val_rel is None:
+        raise QuantizationSkipped(
+            f"Could not find COCO split directory for '{val_split}' under '{coco_root}'. "
+            f"Checked: '{coco_root / val_split}' and '{coco_root / ('images/' + val_split)}'."
+        )
+
+    train_rel = _find_split_rel("train2017")
+    if train_rel is None:
+        # Fall back to val split when train set is unavailable.
+        train_rel = val_rel
+
+    names = {i: f"class_{i}" for i in range(80)}
+    data_yaml = {
+        "path": str(coco_root),
+        "train": train_rel,
+        "val": val_rel,
+        "names": names,
+    }
+
+    out_dir = Path(config.output.results_dir) / config.name / "yolo_exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "coco_yolo_export.yaml"
+    with open(out_path, "w") as f:
+        yaml.safe_dump(data_yaml, f, sort_keys=False)
+    return out_path
+
+
+def evaluate_quantized_yolo_detection(
+    model: BaseModel,
+    config: ExperimentConfig,
+    checkpoint_manager: CheckpointManager,
+    logger: MetricsLogger,
+    text_logger,
+    mode: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+    """
+    Quantize YOLO via Ultralytics export (INT8) and evaluate on COCO.
+    """
+    from src.models.detection import YOLOWrapper
+
+    canonical_mode = _resolve_yolo_quant_mode(mode)
+    quant_cfg = config.quantization
+    export_format = _resolve_yolo_export_format(config)
+    valid_int8_formats = {
+        "openvino",
+        "engine",
+        "coreml",
+        "saved_model",
+        "tflite",
+        "tfjs",
+        "mnn",
+        "imx",
+        "axelera",
+    }
+    if export_format not in valid_int8_formats:
+        raise ValueError(
+            f"YOLO export format '{export_format}' is not supported for int8. "
+            f"Use one of: {sorted(valid_int8_formats)}"
+        )
+    precision_label = f"{canonical_mode}_{export_format}".upper()
+
+    if not _is_yolo_model(model):
+        raise ValueError("evaluate_quantized_yolo_detection() requires a YOLO model.")
+
+    source_yolo = model._yolo
+    source_nn = source_yolo.model
+    original_size_mb = get_model_size_mb(source_nn)
+
+    data_arg = quant_cfg.yolo_data or str(_build_yolo_data_yaml(config))
+    calib_fraction, calib_source, calib_target_images, calib_total_images = _resolve_yolo_calibration_fraction(
+        quant_cfg=quant_cfg,
+        data_arg=data_arg,
+        text_logger=text_logger,
+    )
+
+    export_root = Path(quant_cfg.yolo_export_dir or (Path(config.output.results_dir) / config.name / "yolo_exports"))
+    export_root.mkdir(parents=True, exist_ok=True)
+    export_name = f"{model.name}_{export_format}_int8"
+    export_dir = (export_root / export_name).resolve()
+    manifest_path = _yolo_export_manifest_path(export_dir)
+    expected_cache_key = _build_yolo_export_cache_key(
+        config=config,
+        model_name=model.name,
+        canonical_mode=canonical_mode,
+        export_format=export_format,
+        data_arg=data_arg,
+        quant_cfg=quant_cfg,
+        calib_fraction=calib_fraction,
+        calib_source=calib_source,
+    )
+
+    text_logger.info(
+        f"  Quantizing {model.name} via Ultralytics export – mode={canonical_mode}, format={export_format}"
+    )
+
+    # Optional ORT global thread-pool tuning.
+    # Keep this OFF by default: enabling it can trigger "use_per_session_threads
+    # must be false when using a global thread pool" warnings in some exporters.
+    if os.environ.get("QDA_ORT_GLOBAL_THREAD_POOLS", "0") == "1":
+        try:
+            import onnxruntime as ort
+            intra_threads = int(os.environ.get("QDA_ORT_INTRA_THREADS", "1"))
+            inter_threads = int(os.environ.get("QDA_ORT_INTER_THREADS", "1"))
+            ort.set_global_thread_pool_sizes(
+                intra_op_num_threads=max(intra_threads, 1),
+                inter_op_num_threads=max(inter_threads, 1),
+            )
+        except Exception:
+            # Non-fatal: export can still proceed without this tuning.
+            pass
+
+    export_kwargs = {
+        "format": export_format,
+        "int8": True,
+        "data": data_arg,
+        "fraction": calib_fraction,
+        "imgsz": quant_cfg.yolo_imgsz,
+        "batch": quant_cfg.yolo_batch,
+        "project": str(export_root),
+        "name": export_name,
+        "exist_ok": True,
+        "verbose": False,
+    }
+    if calib_total_images is not None and calib_target_images is not None:
+        actual_images = min(calib_target_images, calib_total_images)
+        text_logger.info(
+            "  INT8 calibration budget: "
+            f"source={calib_source}, fraction={calib_fraction:.4f}, "
+            f"images~{actual_images}/{calib_total_images}, batch={quant_cfg.yolo_batch}"
+        )
+    else:
+        text_logger.info(
+            "  INT8 calibration budget: "
+            f"source={calib_source}, fraction={calib_fraction:.4f}, batch={quant_cfg.yolo_batch}"
+        )
+    if export_format == "engine":
+        # TensorRT export needs explicit device on multi-device hosts.
+        export_kwargs["device"] = config.device
+        # Build dynamic TRT profiles so runtime can accept batch sizes that
+        # differ from the calibration/export batch (e.g., batch 1 in wrapper).
+        export_kwargs["dynamic"] = True
+
+    exported_path: Optional[Path] = None
+    export_reused = False
+
+    if export_format == "engine" and quant_cfg.reuse_yolo_export:
+        existing_export_dir = export_dir
+        existing_candidates = sorted(
+            existing_export_dir.glob("*.engine"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if existing_candidates and manifest_path.exists():
+            manifest = _load_json_file(manifest_path)
+            if manifest and manifest.get("cache_key") == expected_cache_key:
+                exported_path = existing_candidates[0].resolve()
+                export_reused = True
+                text_logger.info(
+                    f"  Reusing existing YOLO export: {exported_path} "
+                    "(cache key matched; set quantization.reuse_yolo_export=false to force rebuild)"
+                )
+            else:
+                text_logger.info(
+                    "  Existing YOLO export cache key mismatch; rebuilding export "
+                    "(e.g., seed/config/calibration changed)."
+                )
+        elif existing_candidates and not manifest_path.exists():
+            text_logger.info(
+                "  Found existing YOLO engine without cache manifest; rebuilding once to create "
+                "seed/config-aware cache metadata."
+            )
+
+    if exported_path is None:
+        t0 = time.time()
+        try:
+            exported = source_yolo.export(**export_kwargs)
+        except Exception as e:
+            raise QuantizationSkipped(
+                f"YOLO INT8 export failed for format='{export_format}'. "
+                f"Check backend dependencies and calibration data (quantization.yolo_data). "
+                f"Original error: {e}"
+            ) from e
+        quant_time = time.time() - t0
+
+        exported_path = Path(exported)
+        if not exported_path.is_absolute():
+            exported_path = (Path.cwd() / exported_path).resolve()
+        exported_path = _relocate_yolo_export_artifacts(
+            exported_path=exported_path,
+            export_root=export_root,
+            export_name=export_name,
+            text_logger=text_logger,
+        )
+    else:
+        quant_time = 0.0
+
+    quantized_size_mb = _get_path_size_mb(exported_path)
+    q_stats = {
+        "mode": canonical_mode,
+        "mode_description": f"YOLO export INT8 ({export_format})",
+        "original_size_mb": original_size_mb,
+        "quantized_size_mb": quantized_size_mb,
+        "compression_ratio": original_size_mb / max(quantized_size_mb, 1e-6),
+        "size_reduction_pct": (1 - quantized_size_mb / max(original_size_mb, 1e-6)) * 100,
+        "quantization_time_s": quant_time,
+        "original_layers": {},
+        "quantized_layers": {},
+        "target_layers": f"Ultralytics export backend ({export_format})",
+        "export_path": str(exported_path),
+        "calibration_source": calib_source,
+        "calibration_fraction": calib_fraction,
+        "calibration_target_images": calib_target_images,
+        "calibration_total_images": calib_total_images,
+        "export_reused": export_reused,
+    }
+    if export_format == "engine" and not export_reused:
+        _save_json_file(
+            manifest_path,
+            {
+                "cache_key": expected_cache_key,
+                "export_path": str(exported_path),
+                "saved_at": datetime.now().isoformat(),
+            },
+        )
+
+    if export_format == "engine":
+        coverage = _collect_tensorrt_int8_coverage(exported_path)
+        q_stats.update(coverage)
+
+        if coverage.get("coverage_available"):
+            total_layers = int(coverage["total_layers"])
+            int8_layers = int(coverage["int8_layers"])
+            fallback_layers = int(coverage["fallback_layers"])
+            int8_ratio = float(coverage["int8_ratio"]) * 100.0
+            fallback_ratio = float(coverage["fallback_ratio"]) * 100.0
+            text_logger.info(
+                "  TensorRT layer coverage: "
+                f"INT8 {int8_layers}/{total_layers} ({int8_ratio:.1f}%), "
+                f"fallback {fallback_layers}/{total_layers} ({fallback_ratio:.1f}%)"
+            )
+            quant_prefix = f"{model.name}/quantization"
+            quant_log_metrics = {
+                f"{quant_prefix}/total_layers": total_layers,
+                f"{quant_prefix}/int8_layers": int8_layers,
+                f"{quant_prefix}/fallback_layers": fallback_layers,
+                f"{quant_prefix}/int8_ratio": float(coverage["int8_ratio"]),
+                f"{quant_prefix}/fallback_ratio": float(coverage["fallback_ratio"]),
+            }
+            logger.log(quant_log_metrics)
+            if getattr(logger, "wandb_logger", None) is not None:
+                logger.wandb_logger.log_summary(
+                    {
+                        "quantization/total_layers": total_layers,
+                        "quantization/int8_layers": int8_layers,
+                        "quantization/fallback_layers": fallback_layers,
+                        "quantization/int8_ratio": float(coverage["int8_ratio"]),
+                        "quantization/fallback_ratio": float(coverage["fallback_ratio"]),
+                    }
+                )
+        else:
+            text_logger.warning(
+                "  [!] Could not inspect TensorRT layer coverage: "
+                f"{coverage.get('coverage_error', 'unknown error')}"
+            )
+
+    stats_fmt = format_quantization_stats(
+        model_name=model.name,
+        mode=precision_label,
+        stats=q_stats,
+    )
+    print("\n" + stats_fmt)
+
+    # Evaluate using a fresh exported YOLO object so predictor/cache is aligned.
+    from ultralytics import YOLO
+
+    quantized_yolo = YOLO(str(exported_path), task="detect")
+    quantized_yolo.overrides.update(
+        {
+            "task": "detect",
+            "mode": "predict",
+            "data": None,
+            "verbose": False,
+        }
+    )
+    quantized_backbone = YOLOWrapper(quantized_yolo)
+
+    original_backbone = model.backbone
+    model.backbone = quantized_backbone
+    try:
+        metrics = evaluate_model_on_coco(
+            model=model,
+            config=config,
+            checkpoint_manager=checkpoint_manager,
+            logger=logger,
+            text_logger=text_logger,
+            precision=precision_label,
+        )
+    finally:
+        model.backbone = original_backbone
+
+    if config.quantization.compute_detection_drift:
+        fp32_view = SimpleNamespace(
+            name=model.name,
+            backbone=original_backbone,
+            _yolo=getattr(model, "_yolo", None),
+        )
+        quant_view = SimpleNamespace(
+            name=model.name,
+            backbone=quantized_backbone,
+            _yolo=getattr(model, "_yolo", None),
+        )
+        drift_metrics = evaluate_detection_quantization_drift(
+            fp32_model=fp32_view,
+            quantized_model=quant_view,
+            config=config,
+            logger=logger,
+            text_logger=text_logger,
+            precision_label=precision_label,
+        )
+        for k, v in drift_metrics.items():
+            q_stats[f"drift_{k}"] = float(v)
+    else:
+        text_logger.info(
+            f"  Skipping decision drift metrics for {model.name} [{precision_label}] "
+            "(quantization.compute_detection_drift=false)"
+        )
+
+    return metrics, q_stats, precision_label
+
+
+def evaluate_quantized_detection(
+    model: BaseModel,
+    config: ExperimentConfig,
+    checkpoint_manager: CheckpointManager,
+    logger: MetricsLogger,
+    text_logger,
+    mode: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+    """
+    Quantize a detection model and evaluate on COCO.
+
+    - YOLO: Ultralytics export INT8 backend path.
+    - Torchvision detection: torchao path.
+    """
+    if _is_yolo_model(model):
+        return evaluate_quantized_yolo_detection(
+            model=model,
+            config=config,
+            checkpoint_manager=checkpoint_manager,
+            logger=logger,
+            text_logger=text_logger,
+            mode=mode,
+        )
+
+    mode = resolve_mode(mode)
+    _, target_module = _get_detection_quant_target(model)
+
+    text_logger.info(f"  Quantizing {model.name} – {mode} (backbone)...")
+    q_module, q_stats = quantize_model(
+        model=target_module,
+        mode=mode,
+        device=config.device,
+    )
+
+    stats_fmt = format_quantization_stats(
+        model_name=model.name,
+        mode=mode,
+        stats=q_stats,
+    )
+    print("\n" + stats_fmt)
+
+    # Swap in quantized module for evaluation
+    original_module = model.backbone
+    model.backbone = q_module
+
+    try:
+        metrics = evaluate_model_on_coco(
+            model=model,
+            config=config,
+            checkpoint_manager=checkpoint_manager,
+            logger=logger,
+            text_logger=text_logger,
+            precision=mode,
+        )
+    finally:
+        model.backbone = original_module
+
+    if config.quantization.compute_detection_drift:
+        fp32_view = SimpleNamespace(name=model.name, backbone=original_module)
+        quant_view = SimpleNamespace(name=model.name, backbone=q_module)
+        drift_metrics = evaluate_detection_quantization_drift(
+            fp32_model=fp32_view,
+            quantized_model=quant_view,
+            config=config,
+            logger=logger,
+            text_logger=text_logger,
+            precision_label=mode,
+        )
+        for k, v in drift_metrics.items():
+            q_stats[f"drift_{k}"] = float(v)
+    else:
+        text_logger.info(
+            f"  Skipping decision drift metrics for {model.name} [{mode}] "
+            "(quantization.compute_detection_drift=false)"
+        )
+
+    # Free quantized model
+    del q_module
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return metrics, q_stats, mode
+
+
+def _log_wandb_comparison(
+    wandb_logger,
+    model_name: str,
+    all_results: Dict[str, Any],
+):
+    """
+    Log a wandb comparison table + bar charts for one model.
+
+    Creates a single table + bar charts for either:
+      - classification: [precision, top1, top5, size_mb, compression_ratio]
+      - detection: [precision, mAP, mAP50, size_mb, compression_ratio]
+    """
+    if wandb_logger is None or not wandb_logger.enabled:
+        return
+
+    try:
+        import wandb
+    except ImportError:
+        return
+
+    # Detect task type from first available metrics entry
+    first_metrics = None
+    for entry in all_results.values():
+        if entry.get("metrics") is not None:
+            first_metrics = entry["metrics"]
+            break
+
+    if first_metrics is None:
+        return
+
+    is_detection = isinstance(first_metrics, dict) and "mAP" in first_metrics
+
+    if is_detection:
+        columns = ["precision", "mAP", "mAP50", "size_mb", "compression_ratio"]
+        rows = []
+        for prec_key, entry in all_results.items():
+            metrics = entry.get("metrics")
+            stats = entry.get("stats")
+            if not isinstance(metrics, dict):
+                continue
+            size = stats.get("quantized_size_mb", stats.get("original_size_mb", 0)) if stats else 0
+            cr = stats.get("compression_ratio", 1.0) if stats else 1.0
+            rows.append([prec_key, metrics.get("mAP", 0), metrics.get("mAP50", 0), size, cr])
+        if not rows:
+            return
+
+        table = wandb.Table(columns=columns, data=rows)
+        wandb.log({f"{model_name}/comparison_table": table})
+        wandb.log({
+            f"{model_name}/map_comparison": wandb.plot.bar(
+                table, "precision", "mAP",
+                title=f"{model_name} – COCO mAP by Precision",
+            ),
+            f"{model_name}/map50_comparison": wandb.plot.bar(
+                table, "precision", "mAP50",
+                title=f"{model_name} – COCO mAP50 by Precision",
+            ),
+            f"{model_name}/size_comparison": wandb.plot.bar(
+                table, "precision", "size_mb",
+                title=f"{model_name} – Model Size (MB) by Precision",
+            ),
+            f"{model_name}/compression_comparison": wandb.plot.bar(
+                table, "precision", "compression_ratio",
+                title=f"{model_name} – Compression Ratio by Precision",
+            ),
+        })
+        return
+
+    # Classification table/charts
+    columns = ["precision", "top1", "top5", "size_mb", "compression_ratio"]
+    rows = []
+    for prec_key, entry in all_results.items():
+        metrics = entry.get("metrics")
+        stats = entry.get("stats")
+        if metrics is None:
+            continue
+        t1 = metrics.top1_accuracy if hasattr(metrics, "top1_accuracy") else metrics.get("top1_accuracy", 0)
+        t5 = metrics.top5_accuracy if hasattr(metrics, "top5_accuracy") else metrics.get("top5_accuracy", 0)
+        size = stats.get("quantized_size_mb", stats.get("original_size_mb", 0)) if stats else 0
+        cr = stats.get("compression_ratio", 1.0) if stats else 1.0
+        rows.append([prec_key, t1, t5, size, cr])
+    if not rows:
+        return
+
+    table = wandb.Table(columns=columns, data=rows)
+    wandb.log({f"{model_name}/comparison_table": table})
+    wandb.log({
+        f"{model_name}/top1_comparison": wandb.plot.bar(
+            table, "precision", "top1",
+            title=f"{model_name} – Top-1 Accuracy by Precision",
+        ),
+        f"{model_name}/top5_comparison": wandb.plot.bar(
+            table, "precision", "top5",
+            title=f"{model_name} – Top-5 Accuracy by Precision",
+        ),
+        f"{model_name}/size_comparison": wandb.plot.bar(
+            table, "precision", "size_mb",
+            title=f"{model_name} – Model Size (MB) by Precision",
+        ),
+        f"{model_name}/compression_comparison": wandb.plot.bar(
+            table, "precision", "compression_ratio",
+            title=f"{model_name} – Compression Ratio by Precision",
+        ),
+    })
+
+
+def _slugify_wandb_token(value: str) -> str:
+    """Convert run name tokens to a readable, wandb-friendly form."""
+    allowed = []
+    for ch in value.lower():
+        if ch.isalnum():
+            allowed.append(ch)
+        else:
+            allowed.append("-")
+    token = "".join(allowed)
+    while "--" in token:
+        token = token.replace("--", "-")
+    return token.strip("-")
+
+
+def _build_wandb_phase_name(model_name: str, task: str, precision: str) -> str:
+    """Build consistent run names like 'yolov8n-detection-fp32'."""
+    return "-".join(
+        [
+            _slugify_wandb_token(model_name),
+            _slugify_wandb_token(task),
+            _slugify_wandb_token(precision),
+        ]
+    )
+
+
+def _build_wandb_phase_loggers(
+    config: ExperimentConfig,
+    model_name: str,
+    task: str,
+    precision: str,
+) -> Tuple[Optional[WandbLogger], MetricsLogger]:
+    """
+    Create per-phase wandb + metrics logger.
+
+    Each (model, precision) phase is logged as its own wandb run to simplify
+    run-level comparisons in the UI sidebar.
+    """
+    if not config.logging.wandb.enabled:
+        return None, MetricsLogger(config, None)
+
+    run_name = _build_wandb_phase_name(model_name=model_name, task=task, precision=precision)
+    run_group = _slugify_wandb_token(config.name)
+    base_tags = [
+        f"model:{model_name}",
+        f"task:{task}",
+        f"precision:{precision}",
+    ]
+    run_config = {
+        "phase_model": model_name,
+        "phase_task": task,
+        "phase_precision": precision,
+    }
+    wandb_logger = WandbLogger(
+        config=config,
+        run_name=run_name,
+        run_group=run_group,
+        run_job_type=f"{task}_{_slugify_wandb_token(precision)}",
+        extra_tags=base_tags,
+        extra_config=run_config,
+    )
+    return wandb_logger, MetricsLogger(config, wandb_logger)
 
 
 def main():
@@ -692,12 +1839,13 @@ def main():
     text_logger = setup_logging(config)
     text_logger.info(f"Starting experiment: {config.name}")
     text_logger.info(f"Configuration: {args.config}")
+    if config.device.startswith("cuda") and not torch.cuda.is_available():
+        text_logger.warning(
+            f"CUDA requested ({config.device}) but not available. Falling back to CPU."
+        )
+        config.device = "cpu"
     text_logger.info(f"Device: {config.device}")
     text_logger.info(f"Debug mode: {config.debug}")
-    
-    # Initialize wandb logger
-    wandb_logger = WandbLogger(config) if config.logging.wandb.enabled else None
-    metrics_logger = MetricsLogger(config, wandb_logger)
     
     # Initialize checkpoint manager
     checkpoint_manager = CheckpointManager(config)
@@ -756,7 +1904,13 @@ def main():
         
         # ── Phase 1: FP32 Baseline ──
         fp32_results = {}
-        
+        fp32_wandb_logger, fp32_metrics_logger = _build_wandb_phase_loggers(
+            config=config,
+            model_name=model_config.name,
+            task=model.task,
+            precision="fp32",
+        )
+
         for dataset_name in datasets_to_eval:
             if dataset_name not in config.datasets:
                 text_logger.warning(f"  [!] Dataset {dataset_name} not in config, skipping")
@@ -768,7 +1922,7 @@ def main():
                         model=model,
                         config=config,
                         checkpoint_manager=checkpoint_manager,
-                        logger=metrics_logger,
+                        logger=fp32_metrics_logger,
                         text_logger=text_logger,
                     )
                     fp32_results[dataset_name] = metrics
@@ -779,7 +1933,7 @@ def main():
                         model=model,
                         config=config,
                         checkpoint_manager=checkpoint_manager,
-                        logger=metrics_logger,
+                        logger=fp32_metrics_logger,
                         text_logger=text_logger,
                     )
                     fp32_results[dataset_name] = metrics
@@ -790,7 +1944,7 @@ def main():
                         model=model,
                         config=config,
                         checkpoint_manager=checkpoint_manager,
-                        logger=metrics_logger,
+                        logger=fp32_metrics_logger,
                         text_logger=text_logger,
                     )
                     fp32_results[dataset_name] = metrics
@@ -807,61 +1961,187 @@ def main():
             except Exception as e:
                 text_logger.error(f"  [!] Error evaluating on {dataset_name}: {e}")
                 raise
-        
         # ── Phase 2: Quantized Evaluation ──
+        # Collect per-precision results for wandb comparison chart
+        model_comparison = {}  # precision_key -> {"metrics": ..., "stats": ...}
+
+        # Add FP32 baseline to comparison (task-specific reference dataset)
+        fp32_reference_metrics = None
+        reference_dataset = None
+        reference_task = model.task
+
+        if model.task == "classification":
+            fp32_reference_metrics = fp32_results.get("imagenet")
+            reference_dataset = "imagenet"
+            quant_target = model.backbone
+        elif model.task == "detection":
+            fp32_reference_metrics = fp32_results.get("coco")
+            reference_dataset = "coco"
+            if _is_yolo_model(model):
+                quant_target = model._yolo.model
+            else:
+                _, quant_target = _get_detection_quant_target(model)
+        else:
+            quant_target = model.backbone
+
+        fp32_size = get_model_size_mb(quant_target)
+        fp32_size_metrics = {"model_size_mb": float(fp32_size)}
+        if reference_dataset is not None:
+            fp32_size_metrics[f"{model_config.name}/{reference_dataset}/model_size_mb"] = float(fp32_size)
+        fp32_metrics_logger.log(fp32_size_metrics)
+        if getattr(fp32_metrics_logger, "wandb_logger", None) is not None:
+            fp32_metrics_logger.wandb_logger.log_summary(
+                {
+                    "model_size_mb": fp32_size,
+                }
+            )
+
+        if fp32_reference_metrics is not None:
+            model_comparison["FP32"] = {
+                "metrics": fp32_reference_metrics,
+                "stats": {
+                    "original_size_mb": fp32_size,
+                    "quantized_size_mb": fp32_size,
+                    "compression_ratio": 1.0,
+                    "size_reduction_pct": 0.0,
+                },
+            }
+        if fp32_wandb_logger:
+            fp32_wandb_logger.finish()
+
         if quant_enabled and quant_modes:
             for qmode in quant_modes:
-                text_logger.info(f"\n  ── INT8 {qmode} quantization ──")
-
-                if model.task != "classification":
-                    text_logger.info(
-                        f"  Skipping quantization for {model_config.name} "
-                        f"(task={model.task}, classification only for now)"
-                    )
+                run_mode = qmode
+                try:
+                    if model.task == "classification":
+                        run_mode = resolve_mode(qmode)
+                    elif model.task == "detection" and not _is_yolo_model(model):
+                        run_mode = resolve_mode(qmode)
+                except ValueError as e:
+                    text_logger.error(f"  [!] Invalid quantization mode '{qmode}': {e}")
                     continue
 
+                text_logger.info(f"\n  ── {run_mode} quantization ──")
+                if model.task == "detection" and _is_yolo_model(model):
+                    try:
+                        yolo_mode = _resolve_yolo_quant_mode(run_mode)
+                        yolo_format = _resolve_yolo_export_format(config)
+                        phase_precision = f"{yolo_mode}_{yolo_format}".lower()
+                    except Exception:
+                        phase_precision = str(run_mode).lower()
+                else:
+                    phase_precision = str(run_mode).lower()
+                q_wandb_logger, q_metrics_logger = _build_wandb_phase_loggers(
+                    config=config,
+                    model_name=model_config.name,
+                    task=model.task,
+                    precision=phase_precision,
+                )
+
                 try:
-                    q_metrics, q_stats = evaluate_quantized_classification(
-                        model=model,
-                        config=config,
-                        checkpoint_manager=checkpoint_manager,
-                        logger=metrics_logger,
-                        text_logger=text_logger,
-                        mode=qmode,
-                    )
+                    if model.task == "classification":
+                        q_metrics, q_stats = evaluate_quantized_classification(
+                            model=model,
+                            config=config,
+                            checkpoint_manager=checkpoint_manager,
+                            logger=q_metrics_logger,
+                            text_logger=text_logger,
+                            mode=run_mode,
+                        )
+                        result_key = run_mode
 
-                    # Store results
-                    prec_key = f"int8_{qmode}"
-                    if "imagenet" in all_results[model_config.name]:
-                        all_results[model_config.name]["imagenet"][prec_key] = q_metrics
+                        # Store results
+                        if "imagenet" in all_results[model_config.name]:
+                            all_results[model_config.name]["imagenet"][result_key] = q_metrics
+                        else:
+                            all_results[model_config.name]["imagenet"] = {result_key: q_metrics}
+
+                    elif model.task == "detection":
+                        if "coco" not in datasets_to_eval:
+                            text_logger.info(
+                                "  Skipping detection quantization: COCO is not in selected datasets"
+                            )
+                            continue
+
+                        q_metrics, q_stats, result_key = evaluate_quantized_detection(
+                            model=model,
+                            config=config,
+                            checkpoint_manager=checkpoint_manager,
+                            logger=q_metrics_logger,
+                            text_logger=text_logger,
+                            mode=run_mode,
+                        )
+
+                        # Store results
+                        if "coco" in all_results[model_config.name]:
+                            all_results[model_config.name]["coco"][result_key] = q_metrics
+                        else:
+                            all_results[model_config.name]["coco"] = {result_key: q_metrics}
+
                     else:
-                        all_results[model_config.name]["imagenet"] = {prec_key: q_metrics}
+                        text_logger.info(
+                            f"  Skipping quantization for {model_config.name} "
+                            f"(unsupported task={model.task})"
+                        )
+                        continue
 
-                    # Print comparison
-                    fp32_m = fp32_results.get("imagenet")
-                    if fp32_m is not None:
+                    # Store for comparison chart
+                    model_comparison[result_key] = {
+                        "metrics": q_metrics,
+                        "stats": q_stats,
+                    }
+
+                    if getattr(q_metrics_logger, "wandb_logger", None) is not None:
+                        q_size = q_stats.get(
+                            "quantized_size_mb",
+                            q_stats.get("original_size_mb", 0.0),
+                        )
+                        q_size_metrics = {"model_size_mb": float(q_size)}
+                        if reference_dataset is not None:
+                            q_size_metrics[f"{model_config.name}/{reference_dataset}/model_size_mb"] = float(q_size)
+                        q_metrics_logger.log(q_size_metrics)
+                        q_metrics_logger.wandb_logger.log_summary(
+                            {
+                                "model_size_mb": q_size,
+                            }
+                        )
+
+                    # Print comparison vs FP32
+                    if fp32_reference_metrics is not None and reference_dataset is not None:
                         comparison = format_comparison_row(
                             model_name=model_config.name,
-                            dataset_name="imagenet",
-                            task="classification",
-                            fp32_metrics=fp32_m,
+                            dataset_name=reference_dataset,
+                            task=reference_task,
+                            fp32_metrics=fp32_reference_metrics,
                             quant_metrics=q_metrics,
-                            quant_mode=qmode,
+                            quant_mode=result_key,
                             quant_stats=q_stats,
                         )
                         print("\n" + comparison)
 
+                except QuantizationSkipped as e:
+                    text_logger.warning(
+                        f"  [!] Skipping {run_mode} for {model_config.name}: {e}"
+                    )
+                    continue
                 except Exception as e:
                     text_logger.error(
-                        f"  [!] Error during INT8 {qmode} for {model_config.name}: {e}"
+                        f"  [!] Error during {run_mode} for {model_config.name}: {e}"
                     )
                     import traceback
                     traceback.print_exc()
                     continue
+                finally:
+                    if q_wandb_logger:
+                        q_wandb_logger.finish()
+
+        # Comparison charts are omitted when logging each precision as a separate
+        # wandb run. Run-level comparison is then handled directly in wandb UI.
         
         # Clear model from memory
         del model
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # Log final summary using unified formatting
     # Flatten nested results for backward-compat with format_final_summary
@@ -877,10 +2157,6 @@ def main():
     
     summary = format_final_summary(flat_results, task_types)
     text_logger.info(summary)
-    
-    # Finish wandb
-    if wandb_logger:
-        wandb_logger.finish()
     
     text_logger.info("Experiment completed successfully!")
     

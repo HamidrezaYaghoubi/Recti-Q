@@ -1,7 +1,5 @@
 # INT8 Quantization – YOLO Detection Models
-# YOLO uses ultralytics which has its own export/quantization pipeline.
-# For now we apply torch dynamic quantization to the PyTorch backbone,
-# and compare with ultralytics ONNX INT8 export in a later phase.
+# Uses Ultralytics export backends (OpenVINO/TensorRT) instead of torchao.
 
 experiment:
   name: "quantize_yolo"
@@ -30,22 +28,34 @@ datasets:
     name: "coco"
     root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/coco"
     split: "val2017"
-    batch_size: 16
+    batch_size: 256
     shuffle: false
     num_workers: 4
     pin_memory: true
 
 quantization:
   enabled: true
-  modes: ["dynamic"]              # Dynamic only for YOLO (safe start)
+  # YOLO path supports INT8 via export backends.
+  # Use yolo_format: "auto" to choose engine on CUDA, openvino on CPU.
+  # You can also force "engine" or "openvino".
+  #
+  # Calibration amount precedence (highest to lowest):
+  # 1) num_calibration_batches
+  # 2) calibration.num_samples
+  # 3) yolo_fraction
+  modes: ["YOLO_INT8"]
   precision: ["int8"]
-  backend: "x86"
-  per_channel: true
+  yolo_format: "auto"
+  yolo_data: null
+  yolo_fraction: 0.25
+  yolo_imgsz: 640
+  yolo_batch: 8
+  yolo_export_dir: "./results/yolo_exports"
+  reuse_yolo_export: true
+  compute_detection_drift: true
   num_calibration_batches: 50
   calibration:
-    method: "minmax"
-    num_samples: 500
-  skip_layers: []
+    num_samples: null
 
 logging:
   level: "INFO"
@@ -56,7 +66,7 @@ logging:
     project: "quantization-decision-analysis"
     entity: null
     tags: ["quantization", "int8", "detection", "yolo", "coco"]
-    notes: "Week 2: INT8 quantization for YOLO models"
+    notes: "YOLO INT8 export quantization (OpenVINO/TensorRT) on COCO"
 
 output:
   save_predictions: true

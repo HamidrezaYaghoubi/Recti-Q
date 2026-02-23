@@ -218,6 +218,11 @@ wandb/
 checkpoints/
 !checkpoints/.gitkeep
 *.pt
+
+# Local export artifacts (Ultralytics / TensorRT)
+*.engine
+*.onnx
+*.cache
 *.pth
 *.ckpt
 
