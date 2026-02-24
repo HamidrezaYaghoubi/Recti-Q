@@ -1,0 +1,95 @@
+# YOLOv8 Fine-Tuning on BDD100K (no quantization in this stage)
+
+experiment:
+  name: "finetune_bdd100k_yolo"
+  description: "Two-stage YOLOv8 fine-tuning on BDD100K"
+  seed: 42
+  device: "cuda"
+  num_workers: 4
+  debug: false
+  debug_samples: 100
+
+models:
+  - name: "yolov8n"
+    architecture: "yolov8n"
+    weights: "COCO"
+    task: "detection"
+    num_classes: 10
+
+  - name: "yolov8m"
+    architecture: "yolov8m"
+    weights: "COCO"
+    task: "detection"
+    num_classes: 10
+
+datasets:
+  bdd100k:
+    name: "bdd100k"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/bdd100k"
+    split: "val"
+    batch_size: 16
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+
+# Dedicated section consumed by src/finetune.py
+fine_tuning:
+  dataset: "bdd100k"
+  # init_mode: pretrained | scratch
+  init_mode: "pretrained"
+  custom_weights: null
+
+  # Ultralytics train args
+  project_dir: "./results/finetune_runs"
+  imgsz: 640
+  batch: 16
+  workers: 4
+  optimizer: "AdamW"
+  weight_decay: 0.0005
+  momentum: 0.937
+  patience: 30
+  cache: false
+  amp: true
+  cos_lr: true
+  close_mosaic: 10
+  val: true
+  save: true
+  deterministic: true
+
+  # Stage 1: adapt detection head first (partial freeze)
+  stage1:
+    epochs: 5
+    freeze: 10
+    lr0: 0.001
+    lrf: 0.01
+
+  # Stage 2: full-model fine-tuning (set epochs: 0 for warmup-only)
+  stage2:
+    epochs: 0
+    freeze: 0
+    lr0: 0.0005
+    lrf: 0.01
+
+  eval:
+    run_after_training: true
+    split: "val"
+    batch: 16
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_dir: "./logs"
+  wandb:
+    enabled: true
+    project: "quantization-decision-analysis"
+    entity: null
+    tags: ["finetune", "bdd100k", "yolov8", "detection"]
+    notes: "Two-stage fine-tuning on BDD100K"
+
+output:
+  save_predictions: false
+  prediction_format: "pickle"
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  save_boxes: false
+  save_scores: false
