@@ -126,6 +126,22 @@ def set_seed(seed: int) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+def _safe_cuda_empty_cache(text_logger=None) -> None:
+    """
+    Best-effort CUDA cache cleanup.
+
+    After a CUDA illegal-memory-access, empty_cache may throw again. This helper
+    prevents those secondary failures from crashing the full experiment loop.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception as e:
+        if text_logger is not None:
+            text_logger.warning(f"  [!] Skipping torch.cuda.empty_cache() due to CUDA state error: {e}")
+
+
 def run_inference(
     model: BaseModel,
     dataloader: DataLoader,
@@ -532,29 +548,17 @@ def evaluate_model_on_coco(
     )
     print("\n" + formatted)
 
-    # Log to wandb.
-    # Each precision is now its own run, so keep metric keys identical across
-    # runs to make FP32 vs INT8 comparisons straightforward in wandb UI.
-    wandb_prefix = f"{model.name}/coco"
-    coco_log_metrics = {
-        # Existing keys (kept for backward compatibility)
-        f"{wandb_prefix}/mAP": metrics["mAP"],
-        f"{wandb_prefix}/mAP50": metrics["mAP50"],
-        f"{wandb_prefix}/mAP75": metrics["mAP75"],
-        f"{wandb_prefix}/mAP_small": metrics["mAP_small"],
-        f"{wandb_prefix}/mAP_medium": metrics["mAP_medium"],
-        f"{wandb_prefix}/mAP_large": metrics["mAP_large"],
-        f"{wandb_prefix}/AR_100": metrics["AR_100"],
-        # Canonical aliases for cleaner panel naming
-        f"{wandb_prefix}/map": metrics["mAP"],
-        f"{wandb_prefix}/map_50": metrics["mAP50"],
-        f"{wandb_prefix}/map75": metrics["mAP75"],
-        f"{wandb_prefix}/map_small": metrics["mAP_small"],
-        f"{wandb_prefix}/map_medium": metrics["mAP_medium"],
-        f"{wandb_prefix}/map_large": metrics["mAP_large"],
-        f"{wandb_prefix}/ar_100": metrics["AR_100"],
+    # Log flat keys for clean cross-run comparison in wandb.
+    detection_log_metrics = {
+        "map": metrics["mAP"],
+        "map_50": metrics["mAP50"],
+        "map75": metrics["mAP75"],
+        "map_small": metrics["mAP_small"],
+        "map_medium": metrics["mAP_medium"],
+        "map_large": metrics["mAP_large"],
+        "ar_100": metrics["AR_100"],
     }
-    logger.log(coco_log_metrics)
+    logger.log(detection_log_metrics)
 
     # Also write concise summary keys for run-table comparison.
     if getattr(logger, "wandb_logger", None) is not None:
@@ -590,6 +594,228 @@ def evaluate_model_on_coco(
     return metrics
 
 
+def _extract_ultralytics_detection_metrics(val_results) -> Dict[str, float]:
+    """
+    Extract detection metrics from ultralytics val() results.
+    """
+    box = getattr(val_results, "box", None)
+    results_dict = getattr(val_results, "results_dict", {}) or {}
+
+    def _from_box(attr: str, fallback_key: str) -> float:
+        if box is not None and hasattr(box, attr):
+            try:
+                return float(getattr(box, attr)) * 100.0
+            except Exception:
+                pass
+        return float(results_dict.get(fallback_key, 0.0)) * 100.0
+
+    return {
+        "mAP": _from_box("map", "metrics/mAP50-95(B)"),
+        "mAP50": _from_box("map50", "metrics/mAP50(B)"),
+        "mAP75": _from_box("map75", "metrics/mAP75(B)"),
+        # Not always available from ultralytics val() summaries on custom YOLO sets.
+        "mAP_small": 0.0,
+        "mAP_medium": 0.0,
+        "mAP_large": 0.0,
+        "AR_100": 0.0,
+    }
+
+
+def _get_yolo_runtime_handle(model: BaseModel):
+    """
+    Return the underlying ultralytics YOLO runtime object if available.
+    """
+    backbone = getattr(model, "backbone", None)
+    if backbone is not None and hasattr(backbone, "yolo"):
+        return backbone.yolo
+    yolo_obj = getattr(model, "_yolo", None)
+    if yolo_obj is not None:
+        return yolo_obj
+    return None
+
+
+def _build_bdd_data_yaml(config: ExperimentConfig) -> Path:
+    """
+    Build a local BDD100K YOLO dataset yaml.
+
+    This ignores upstream absolute Kaggle paths and uses local root from config.
+    """
+    import yaml
+
+    dataset_cfg = config.get_dataset("bdd100k")
+    root = Path(dataset_cfg.root).resolve()
+
+    if not (root / "train" / "images").exists():
+        raise FileNotFoundError(f"Expected BDD100K train images at: {root / 'train' / 'images'}")
+    if not (root / "val" / "images").exists():
+        raise FileNotFoundError(f"Expected BDD100K val images at: {root / 'val' / 'images'}")
+
+    names = [
+        "person",
+        "rider",
+        "car",
+        "bus",
+        "truck",
+        "bike",
+        "motor",
+        "traffic light",
+        "traffic sign",
+        "train",
+    ]
+    # Try to preserve names from dataset data.yaml if present.
+    source_yaml = root / "data.yaml"
+    if source_yaml.exists():
+        try:
+            with open(source_yaml, "r") as f:
+                payload = yaml.safe_load(f) or {}
+            yaml_names = payload.get("names")
+            if isinstance(yaml_names, list) and yaml_names:
+                names = [str(x) for x in yaml_names]
+            elif isinstance(yaml_names, dict) and yaml_names:
+                names = [str(yaml_names[k]) for k in sorted(yaml_names.keys(), key=lambda v: int(v))]
+        except Exception:
+            pass
+
+    data_yaml = {
+        "path": str(root),
+        "train": "train/images",
+        "val": "val/images",
+        "test": "test/images",
+        "names": names,
+    }
+
+    out_dir = Path(config.output.results_dir) / config.name / "yolo_exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "bdd100k_yolo_eval.yaml"
+    with open(out_path, "w") as f:
+        yaml.safe_dump(data_yaml, f, sort_keys=False)
+    return out_path
+
+
+def evaluate_model_on_bdd(
+    model: BaseModel,
+    config: ExperimentConfig,
+    checkpoint_manager: CheckpointManager,
+    logger: MetricsLogger,
+    text_logger,
+    precision: str = "fp32",
+) -> Dict[str, Any]:
+    """
+    Evaluate YOLO detection model on BDD100K using ultralytics val().
+    """
+    dataset_config = config.get_dataset("bdd100k")
+    split = dataset_config.split or "val"
+
+    yolo_runtime = _get_yolo_runtime_handle(model)
+    if yolo_runtime is None:
+        raise QuantizationSkipped(
+            "BDD100K evaluation currently supports YOLO-backed detection models only."
+        )
+
+    data_arg = config.quantization.yolo_data or str(_build_bdd_data_yaml(config))
+    text_logger.info(f"  Evaluating on BDD100K [{precision}]...")
+
+    eval_batch = int(dataset_config.batch_size)
+    if "ENGINE" in precision.upper():
+        trt_max_batch = int(config.quantization.yolo_batch)
+        if eval_batch > trt_max_batch:
+            text_logger.info(
+                f"  BDD eval batch={eval_batch} exceeds TensorRT profile max batch={trt_max_batch}; "
+                f"using batch={trt_max_batch}."
+            )
+            eval_batch = trt_max_batch
+
+    val_results = yolo_runtime.val(
+        data=data_arg,
+        split=split,
+        batch=eval_batch,
+        imgsz=config.quantization.yolo_imgsz,
+        device=config.device,
+        verbose=False,
+    )
+
+    metrics = _extract_ultralytics_detection_metrics(val_results)
+    metrics["num_images"] = 0
+    metrics["total_detections"] = 0
+    metrics["avg_detections_per_image"] = 0.0
+
+    formatted = format_detection_results(
+        model_name=model.name,
+        dataset_name=f"BDD100K {split}",
+        metrics=metrics,
+        precision=precision,
+        verbose=True,
+    )
+    print("\n" + formatted)
+
+    logger.log(
+        {
+            "map": metrics["mAP"],
+            "map_50": metrics["mAP50"],
+            "map75": metrics["mAP75"],
+            "map_small": metrics["mAP_small"],
+            "map_medium": metrics["mAP_medium"],
+            "map_large": metrics["mAP_large"],
+            "ar_100": metrics["AR_100"],
+        }
+    )
+
+    if getattr(logger, "wandb_logger", None) is not None:
+        logger.wandb_logger.log_summary(
+            {
+                "map": metrics["mAP"],
+                "map_50": metrics["mAP50"],
+                "map75": metrics["mAP75"],
+                "map_small": metrics["mAP_small"],
+                "map_medium": metrics["mAP_medium"],
+                "map_large": metrics["mAP_large"],
+                "ar_100": metrics["AR_100"],
+            }
+        )
+
+    checkpoint_manager.save_metrics(
+        metrics=metrics,
+        model_name=model.name,
+        dataset_name="bdd100k",
+        precision=precision,
+    )
+
+    return metrics
+
+
+def evaluate_model_on_detection_dataset(
+    model: BaseModel,
+    config: ExperimentConfig,
+    checkpoint_manager: CheckpointManager,
+    logger: MetricsLogger,
+    text_logger,
+    dataset_name: str,
+    precision: str = "fp32",
+) -> Dict[str, Any]:
+    """
+    Dispatch detection evaluation to the selected dataset.
+    """
+    if dataset_name == "coco":
+        return evaluate_model_on_coco(
+            model=model,
+            config=config,
+            checkpoint_manager=checkpoint_manager,
+            logger=logger,
+            text_logger=text_logger,
+            precision=precision,
+        )
+    if dataset_name == "bdd100k":
+        return evaluate_model_on_bdd(
+            model=model,
+            config=config,
+            checkpoint_manager=checkpoint_manager,
+            logger=logger,
+            text_logger=text_logger,
+            precision=precision,
+        )
+    raise ValueError(f"Unsupported detection dataset '{dataset_name}'")
+
+
 # ========================================================================
 # Quantized evaluation helpers
 # ========================================================================
@@ -601,31 +827,51 @@ def evaluate_detection_quantization_drift(
     logger: MetricsLogger,
     text_logger,
     precision_label: str,
+    dataset_name: str,
 ) -> Dict[str, float]:
     """
-    Compute FP32-vs-quantized detection drift on COCO and log to wandb.
+    Compute FP32-vs-quantized detection drift on a detection dataset and log to wandb.
 
     This is an output-level comparison (decision drift), not mAP.
     """
-    from src.datasets import get_coco_loader
+    from src.datasets import get_coco_loader, get_bdd100k_loader
     from src.evaluation import compute_detection_quantization_drift
 
-    dataset_config = config.get_dataset("coco")
-    dataloader = get_coco_loader(
-        config=dataset_config,
-        task="detection",
-        num_workers=config.num_workers,
-        debug=config.debug,
-        debug_samples=config.debug_samples,
-    )
+    if dataset_name == "coco":
+        dataset_config = config.get_dataset("coco")
+        dataloader = get_coco_loader(
+            config=dataset_config,
+            task="detection",
+            num_workers=0,
+            debug=config.debug,
+            debug_samples=config.debug_samples,
+        )
+        remap_yolo_labels_to_coco = True
+    elif dataset_name == "bdd100k":
+        dataset_config = config.get_dataset("bdd100k")
+        dataloader = get_bdd100k_loader(
+            config=dataset_config,
+            task="detection",
+            num_workers=0,
+            debug=config.debug,
+            debug_samples=config.debug_samples,
+        )
+        remap_yolo_labels_to_coco = False
+    else:
+        raise QuantizationSkipped(
+            f"Decision drift is not implemented for detection dataset '{dataset_name}'."
+        )
 
     model_name = str(getattr(fp32_model, "name", "model"))
-    text_logger.info(f"  Computing decision drift on COCO [{precision_label}]...")
+    text_logger.info(
+        f"  Computing decision drift on {dataset_name.upper()} [{precision_label}] (num_workers=0)..."
+    )
     drift_all = compute_detection_quantization_drift(
         fp32_model=fp32_model,
         quantized_model=quantized_model,
         dataloader=dataloader,
         device=config.device,
+        remap_yolo_labels_to_coco=remap_yolo_labels_to_coco,
         description=f"Drift - {model_name} [{precision_label}]",
     )
 
@@ -639,11 +885,10 @@ def evaluate_detection_quantization_drift(
     ]
     drift_metrics = {k: float(drift_all[k]) for k in keys}
 
-    drift_prefix = f"{model_name}/quantization_drift"
-    logger.log({f"{drift_prefix}/{k}": v for k, v in drift_metrics.items()})
+    logger.log({f"drift_{k}": v for k, v in drift_metrics.items()})
 
     if getattr(logger, "wandb_logger", None) is not None:
-        logger.wandb_logger.log_summary(drift_metrics)
+        logger.wandb_logger.log_summary({f"drift_{k}": v for k, v in drift_metrics.items()})
 
     text_logger.info(
         "  Decision drift summary: "
@@ -748,8 +993,7 @@ def evaluate_quantized_classification(
 
     # Free quantized model
     del q_backbone
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _safe_cuda_empty_cache(text_logger=text_logger)
 
     return metrics, q_stats
 
@@ -1004,9 +1248,33 @@ def _normalize_cache_path(path_like: str) -> str:
     return str(path_like)
 
 
+def _infer_yolo_source_weights_id(model: BaseModel) -> str:
+    """
+    Infer a stable identifier for YOLO source weights.
+
+    This is used in export cache keys so switching from COCO -> fine-tuned
+    checkpoints cannot silently reuse stale TensorRT/OpenVINO exports.
+    """
+    yolo_obj = getattr(model, "_yolo", None)
+    if yolo_obj is None:
+        return "unknown"
+
+    candidates = [
+        getattr(yolo_obj, "ckpt_path", None),
+        getattr(yolo_obj, "model_name", None),
+        getattr(yolo_obj, "weights", None),
+    ]
+    for cand in candidates:
+        if cand:
+            return _normalize_cache_path(str(cand))
+
+    return f"builtin:{getattr(model, 'name', 'yolo')}"
+
+
 def _build_yolo_export_cache_key(
     config: ExperimentConfig,
     model_name: str,
+    source_weights_id: str,
     canonical_mode: str,
     export_format: str,
     data_arg: str,
@@ -1018,9 +1286,10 @@ def _build_yolo_export_cache_key(
     Build a deterministic cache key for reusable YOLO exports.
     """
     key = {
-        "key_version": 1,
+        "key_version": 2,
         "seed": int(config.seed),
         "model_name": model_name,
+        "source_weights": _normalize_cache_path(source_weights_id),
         "mode": canonical_mode,
         "format": export_format,
         "device": config.device,
@@ -1213,10 +1482,18 @@ def _collect_tensorrt_int8_coverage(engine_path: Path) -> Dict[str, Any]:
     return coverage
 
 
-def _build_yolo_data_yaml(config: ExperimentConfig) -> Path:
+def _build_yolo_data_yaml(config: ExperimentConfig, dataset_name: str) -> Path:
     """
-    Build a local COCO-style dataset yaml for YOLO export INT8 calibration.
+    Build a local YOLO dataset yaml for export INT8 calibration/evaluation.
     """
+    if dataset_name == "bdd100k":
+        return _build_bdd_data_yaml(config)
+
+    if dataset_name != "coco":
+        raise QuantizationSkipped(
+            f"Unsupported detection dataset '{dataset_name}' for YOLO export YAML building."
+        )
+
     import yaml
 
     dataset_cfg = config.get_dataset("coco")
@@ -1265,9 +1542,10 @@ def evaluate_quantized_yolo_detection(
     logger: MetricsLogger,
     text_logger,
     mode: str,
+    dataset_name: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     """
-    Quantize YOLO via Ultralytics export (INT8) and evaluate on COCO.
+    Quantize YOLO via Ultralytics export (INT8) and evaluate on detection dataset.
     """
     from src.models.detection import YOLOWrapper
 
@@ -1299,7 +1577,7 @@ def evaluate_quantized_yolo_detection(
     source_nn = source_yolo.model
     original_size_mb = get_model_size_mb(source_nn)
 
-    data_arg = quant_cfg.yolo_data or str(_build_yolo_data_yaml(config))
+    data_arg = quant_cfg.yolo_data or str(_build_yolo_data_yaml(config, dataset_name=dataset_name))
     calib_fraction, calib_source, calib_target_images, calib_total_images = _resolve_yolo_calibration_fraction(
         quant_cfg=quant_cfg,
         data_arg=data_arg,
@@ -1311,9 +1589,11 @@ def evaluate_quantized_yolo_detection(
     export_name = f"{model.name}_{export_format}_int8"
     export_dir = (export_root / export_name).resolve()
     manifest_path = _yolo_export_manifest_path(export_dir)
+    source_weights_id = _infer_yolo_source_weights_id(model)
     expected_cache_key = _build_yolo_export_cache_key(
         config=config,
         model_name=model.name,
+        source_weights_id=source_weights_id,
         canonical_mode=canonical_mode,
         export_format=export_format,
         data_arg=data_arg,
@@ -1471,23 +1751,22 @@ def evaluate_quantized_yolo_detection(
                 f"INT8 {int8_layers}/{total_layers} ({int8_ratio:.1f}%), "
                 f"fallback {fallback_layers}/{total_layers} ({fallback_ratio:.1f}%)"
             )
-            quant_prefix = f"{model.name}/quantization"
             quant_log_metrics = {
-                f"{quant_prefix}/total_layers": total_layers,
-                f"{quant_prefix}/int8_layers": int8_layers,
-                f"{quant_prefix}/fallback_layers": fallback_layers,
-                f"{quant_prefix}/int8_ratio": float(coverage["int8_ratio"]),
-                f"{quant_prefix}/fallback_ratio": float(coverage["fallback_ratio"]),
+                "total_layers": total_layers,
+                "int8_layers": int8_layers,
+                "fallback_layers": fallback_layers,
+                "int8_ratio": float(coverage["int8_ratio"]),
+                "fallback_ratio": float(coverage["fallback_ratio"]),
             }
             logger.log(quant_log_metrics)
             if getattr(logger, "wandb_logger", None) is not None:
                 logger.wandb_logger.log_summary(
                     {
-                        "quantization/total_layers": total_layers,
-                        "quantization/int8_layers": int8_layers,
-                        "quantization/fallback_layers": fallback_layers,
-                        "quantization/int8_ratio": float(coverage["int8_ratio"]),
-                        "quantization/fallback_ratio": float(coverage["fallback_ratio"]),
+                        "total_layers": total_layers,
+                        "int8_layers": int8_layers,
+                        "fallback_layers": fallback_layers,
+                        "int8_ratio": float(coverage["int8_ratio"]),
+                        "fallback_ratio": float(coverage["fallback_ratio"]),
                     }
                 )
         else:
@@ -1520,12 +1799,13 @@ def evaluate_quantized_yolo_detection(
     original_backbone = model.backbone
     model.backbone = quantized_backbone
     try:
-        metrics = evaluate_model_on_coco(
+        metrics = evaluate_model_on_detection_dataset(
             model=model,
             config=config,
             checkpoint_manager=checkpoint_manager,
             logger=logger,
             text_logger=text_logger,
+            dataset_name=dataset_name,
             precision=precision_label,
         )
     finally:
@@ -1542,16 +1822,22 @@ def evaluate_quantized_yolo_detection(
             backbone=quantized_backbone,
             _yolo=getattr(model, "_yolo", None),
         )
-        drift_metrics = evaluate_detection_quantization_drift(
-            fp32_model=fp32_view,
-            quantized_model=quant_view,
-            config=config,
-            logger=logger,
-            text_logger=text_logger,
-            precision_label=precision_label,
-        )
-        for k, v in drift_metrics.items():
-            q_stats[f"drift_{k}"] = float(v)
+        try:
+            drift_metrics = evaluate_detection_quantization_drift(
+                fp32_model=fp32_view,
+                quantized_model=quant_view,
+                config=config,
+                logger=logger,
+                text_logger=text_logger,
+                precision_label=precision_label,
+                dataset_name=dataset_name,
+            )
+            for k, v in drift_metrics.items():
+                q_stats[f"drift_{k}"] = float(v)
+        except Exception as e:
+            text_logger.warning(
+                f"  [!] Decision drift failed for {model.name} [{precision_label}]: {e}"
+            )
     else:
         text_logger.info(
             f"  Skipping decision drift metrics for {model.name} [{precision_label}] "
@@ -1568,9 +1854,10 @@ def evaluate_quantized_detection(
     logger: MetricsLogger,
     text_logger,
     mode: str,
+    dataset_name: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     """
-    Quantize a detection model and evaluate on COCO.
+    Quantize a detection model and evaluate on one detection dataset.
 
     - YOLO: Ultralytics export INT8 backend path.
     - Torchvision detection: torchao path.
@@ -1583,6 +1870,7 @@ def evaluate_quantized_detection(
             logger=logger,
             text_logger=text_logger,
             mode=mode,
+            dataset_name=dataset_name,
         )
 
     mode = resolve_mode(mode)
@@ -1607,12 +1895,13 @@ def evaluate_quantized_detection(
     model.backbone = q_module
 
     try:
-        metrics = evaluate_model_on_coco(
+        metrics = evaluate_model_on_detection_dataset(
             model=model,
             config=config,
             checkpoint_manager=checkpoint_manager,
             logger=logger,
             text_logger=text_logger,
+            dataset_name=dataset_name,
             precision=mode,
         )
     finally:
@@ -1621,16 +1910,22 @@ def evaluate_quantized_detection(
     if config.quantization.compute_detection_drift:
         fp32_view = SimpleNamespace(name=model.name, backbone=original_module)
         quant_view = SimpleNamespace(name=model.name, backbone=q_module)
-        drift_metrics = evaluate_detection_quantization_drift(
-            fp32_model=fp32_view,
-            quantized_model=quant_view,
-            config=config,
-            logger=logger,
-            text_logger=text_logger,
-            precision_label=mode,
-        )
-        for k, v in drift_metrics.items():
-            q_stats[f"drift_{k}"] = float(v)
+        try:
+            drift_metrics = evaluate_detection_quantization_drift(
+                fp32_model=fp32_view,
+                quantized_model=quant_view,
+                config=config,
+                logger=logger,
+                text_logger=text_logger,
+                precision_label=mode,
+                dataset_name=dataset_name,
+            )
+            for k, v in drift_metrics.items():
+                q_stats[f"drift_{k}"] = float(v)
+        except Exception as e:
+            text_logger.warning(
+                f"  [!] Decision drift failed for {model.name} [{mode}]: {e}"
+            )
     else:
         text_logger.info(
             f"  Skipping decision drift metrics for {model.name} [{mode}] "
@@ -1639,8 +1934,7 @@ def evaluate_quantized_detection(
 
     # Free quantized model
     del q_module
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _safe_cuda_empty_cache(text_logger=text_logger)
 
     return metrics, q_stats, mode
 
@@ -1765,15 +2059,21 @@ def _slugify_wandb_token(value: str) -> str:
     return token.strip("-")
 
 
-def _build_wandb_phase_name(model_name: str, task: str, precision: str) -> str:
-    """Build consistent run names like 'yolov8n-detection-fp32'."""
-    return "-".join(
-        [
-            _slugify_wandb_token(model_name),
-            _slugify_wandb_token(task),
-            _slugify_wandb_token(precision),
-        ]
-    )
+def _build_wandb_phase_name(
+    model_name: str,
+    task: str,
+    precision: str,
+    dataset_name: Optional[str] = None,
+) -> str:
+    """Build consistent run names like 'yolov8n-detection-bdd100k-fp32'."""
+    tokens = [
+        _slugify_wandb_token(model_name),
+        _slugify_wandb_token(task),
+    ]
+    if dataset_name:
+        tokens.append(_slugify_wandb_token(dataset_name))
+    tokens.append(_slugify_wandb_token(precision))
+    return "-".join(tokens)
 
 
 def _build_wandb_phase_loggers(
@@ -1781,6 +2081,7 @@ def _build_wandb_phase_loggers(
     model_name: str,
     task: str,
     precision: str,
+    dataset_name: Optional[str] = None,
 ) -> Tuple[Optional[WandbLogger], MetricsLogger]:
     """
     Create per-phase wandb + metrics logger.
@@ -1791,23 +2092,36 @@ def _build_wandb_phase_loggers(
     if not config.logging.wandb.enabled:
         return None, MetricsLogger(config, None)
 
-    run_name = _build_wandb_phase_name(model_name=model_name, task=task, precision=precision)
+    run_name = _build_wandb_phase_name(
+        model_name=model_name,
+        task=task,
+        precision=precision,
+        dataset_name=dataset_name,
+    )
     run_group = _slugify_wandb_token(config.name)
     base_tags = [
         f"model:{model_name}",
         f"task:{task}",
         f"precision:{precision}",
     ]
+    if dataset_name:
+        base_tags.append(f"dataset:{dataset_name}")
     run_config = {
         "phase_model": model_name,
         "phase_task": task,
         "phase_precision": precision,
     }
+    if dataset_name:
+        run_config["phase_dataset"] = dataset_name
+    job_tokens = [_slugify_wandb_token(task)]
+    if dataset_name:
+        job_tokens.append(_slugify_wandb_token(dataset_name))
+    job_tokens.append(_slugify_wandb_token(precision))
     wandb_logger = WandbLogger(
         config=config,
         run_name=run_name,
         run_group=run_group,
-        run_job_type=f"{task}_{_slugify_wandb_token(precision)}",
+        run_job_type="_".join(job_tokens),
         extra_tags=base_tags,
         extra_config=run_config,
     )
@@ -1873,7 +2187,7 @@ def main():
     # Track task types for final summary
     task_types = {}
     for ds_name in datasets_to_eval:
-        if ds_name == "coco":
+        if ds_name in {"coco", "bdd100k"}:
             task_types[ds_name] = "detection"
         else:
             task_types[ds_name] = "classification"
@@ -1904,11 +2218,17 @@ def main():
         
         # ── Phase 1: FP32 Baseline ──
         fp32_results = {}
+        if model.task == "detection":
+            candidate_datasets = [ds for ds in datasets_to_eval if ds in {"coco", "bdd100k"}]
+        else:
+            candidate_datasets = [ds for ds in datasets_to_eval if ds not in {"coco", "bdd100k"}]
+        phase_dataset = candidate_datasets[0] if candidate_datasets else None
         fp32_wandb_logger, fp32_metrics_logger = _build_wandb_phase_loggers(
             config=config,
             model_name=model_config.name,
             task=model.task,
             precision="fp32",
+            dataset_name=phase_dataset,
         )
 
         for dataset_name in datasets_to_eval:
@@ -1939,13 +2259,14 @@ def main():
                     fp32_results[dataset_name] = metrics
                     all_results[model_config.name][dataset_name] = {"fp32": metrics}
                 
-                elif dataset_name == "coco":
-                    metrics = evaluate_model_on_coco(
+                elif dataset_name in {"coco", "bdd100k"}:
+                    metrics = evaluate_model_on_detection_dataset(
                         model=model,
                         config=config,
                         checkpoint_manager=checkpoint_manager,
                         logger=fp32_metrics_logger,
                         text_logger=text_logger,
+                        dataset_name=dataset_name,
                     )
                     fp32_results[dataset_name] = metrics
                     all_results[model_config.name][dataset_name] = {"fp32": metrics}
@@ -1957,6 +2278,11 @@ def main():
                     
             except FileNotFoundError as e:
                 text_logger.error(f"  [!] Dataset not found: {e}")
+                continue
+            except QuantizationSkipped as e:
+                text_logger.warning(
+                    f"  [!] Skipping baseline for {model_config.name} on {dataset_name}: {e}"
+                )
                 continue
             except Exception as e:
                 text_logger.error(f"  [!] Error evaluating on {dataset_name}: {e}")
@@ -1975,8 +2301,9 @@ def main():
             reference_dataset = "imagenet"
             quant_target = model.backbone
         elif model.task == "detection":
-            fp32_reference_metrics = fp32_results.get("coco")
-            reference_dataset = "coco"
+            detection_datasets = [ds for ds in datasets_to_eval if ds in {"coco", "bdd100k"}]
+            reference_dataset = detection_datasets[0] if detection_datasets else None
+            fp32_reference_metrics = fp32_results.get(reference_dataset) if reference_dataset else None
             if _is_yolo_model(model):
                 quant_target = model._yolo.model
             else:
@@ -1986,8 +2313,6 @@ def main():
 
         fp32_size = get_model_size_mb(quant_target)
         fp32_size_metrics = {"model_size_mb": float(fp32_size)}
-        if reference_dataset is not None:
-            fp32_size_metrics[f"{model_config.name}/{reference_dataset}/model_size_mb"] = float(fp32_size)
         fp32_metrics_logger.log(fp32_size_metrics)
         if getattr(fp32_metrics_logger, "wandb_logger", None) is not None:
             fp32_metrics_logger.wandb_logger.log_summary(
@@ -2036,6 +2361,7 @@ def main():
                     model_name=model_config.name,
                     task=model.task,
                     precision=phase_precision,
+                    dataset_name=phase_dataset,
                 )
 
                 try:
@@ -2057,11 +2383,19 @@ def main():
                             all_results[model_config.name]["imagenet"] = {result_key: q_metrics}
 
                     elif model.task == "detection":
-                        if "coco" not in datasets_to_eval:
+                        detection_datasets = [ds for ds in datasets_to_eval if ds in {"coco", "bdd100k"}]
+                        if not detection_datasets:
                             text_logger.info(
-                                "  Skipping detection quantization: COCO is not in selected datasets"
+                                "  Skipping detection quantization: no detection dataset selected "
+                                "(supported: coco, bdd100k)"
                             )
                             continue
+                        if len(detection_datasets) > 1:
+                            text_logger.info(
+                                "  Multiple detection datasets selected; "
+                                f"using '{detection_datasets[0]}' for quantized evaluation."
+                            )
+                        detection_dataset = detection_datasets[0]
 
                         q_metrics, q_stats, result_key = evaluate_quantized_detection(
                             model=model,
@@ -2070,13 +2404,14 @@ def main():
                             logger=q_metrics_logger,
                             text_logger=text_logger,
                             mode=run_mode,
+                            dataset_name=detection_dataset,
                         )
 
                         # Store results
-                        if "coco" in all_results[model_config.name]:
-                            all_results[model_config.name]["coco"][result_key] = q_metrics
+                        if detection_dataset in all_results[model_config.name]:
+                            all_results[model_config.name][detection_dataset][result_key] = q_metrics
                         else:
-                            all_results[model_config.name]["coco"] = {result_key: q_metrics}
+                            all_results[model_config.name][detection_dataset] = {result_key: q_metrics}
 
                     else:
                         text_logger.info(
@@ -2097,8 +2432,6 @@ def main():
                             q_stats.get("original_size_mb", 0.0),
                         )
                         q_size_metrics = {"model_size_mb": float(q_size)}
-                        if reference_dataset is not None:
-                            q_size_metrics[f"{model_config.name}/{reference_dataset}/model_size_mb"] = float(q_size)
                         q_metrics_logger.log(q_size_metrics)
                         q_metrics_logger.wandb_logger.log_summary(
                             {
@@ -2140,8 +2473,7 @@ def main():
         
         # Clear model from memory
         del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _safe_cuda_empty_cache(text_logger=text_logger)
     
     # Log final summary using unified formatting
     # Flatten nested results for backward-compat with format_final_summary
