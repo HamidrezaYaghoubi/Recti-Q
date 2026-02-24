@@ -199,6 +199,7 @@ def compute_detection_quantization_drift(
     iou_threshold: float = 0.5,
     score_threshold: float = 0.001,
     gt_iou_threshold: float = 0.5,
+    remap_yolo_labels_to_coco: bool = True,
     max_batches: Optional[int] = None,
     description: str = "Detection decision drift",
 ) -> Dict[str, float]:
@@ -213,6 +214,9 @@ def compute_detection_quantization_drift(
         iou_threshold: IoU threshold used for detection matching.
         score_threshold: Confidence threshold applied to both models before matching.
         gt_iou_threshold: IoU threshold for class-aware prediction-vs-GT matching.
+        remap_yolo_labels_to_coco:
+            If True, remap YOLO class ids (0-79) to COCO category ids before
+            comparison. Keep False for non-COCO datasets like BDD100K.
         max_batches: Optional hard cap on number of processed batches.
         description: tqdm label.
 
@@ -252,12 +256,12 @@ def compute_detection_quantization_drift(
                 fp_boxes, fp_scores, fp_labels = _canonicalize_prediction(
                     fp_pred,
                     score_threshold,
-                    remap_yolo_labels_to_coco=fp32_is_yolo,
+                    remap_yolo_labels_to_coco=(remap_yolo_labels_to_coco and fp32_is_yolo),
                 )
                 q_boxes, q_scores, q_labels = _canonicalize_prediction(
                     q_pred,
                     score_threshold,
-                    remap_yolo_labels_to_coco=quant_is_yolo,
+                    remap_yolo_labels_to_coco=(remap_yolo_labels_to_coco and quant_is_yolo),
                 )
                 gt_boxes, gt_labels = _canonicalize_target(target)
 
