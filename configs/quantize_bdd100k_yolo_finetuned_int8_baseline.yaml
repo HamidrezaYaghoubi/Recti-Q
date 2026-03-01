@@ -1,0 +1,70 @@
+# Baseline INT8 export (no Recti-Q) on fine-tuned YOLO BDD100K models
+
+experiment:
+  name: "quantize_bdd100k_yolo_finetuned_int8_baseline"
+  description: "FP32 + INT8 export quantization for BDD100K fine-tuned YOLOv8 (Recti-Q disabled)"
+  seed: 42
+  device: "cuda"
+  num_workers: 4
+  debug: false
+  debug_samples: 100
+
+models:
+  - name: "yolov8n"
+    architecture: "yolov8n"
+    weights: "./checkpoints/finetune_bdd100k_yolo/finetune/yolov8n_bdd100k_finetuned_best.pt"
+    task: "detection"
+    num_classes: 10
+
+  - name: "yolov8m"
+    architecture: "yolov8m"
+    weights: "./checkpoints/finetune_bdd100k_yolo/finetune/yolov8m_bdd100k_finetuned_best.pt"
+    task: "detection"
+    num_classes: 10
+
+datasets:
+  bdd100k:
+    name: "bdd100k"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/bdd100k"
+    split: "val"
+    batch_size: 64
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+
+quantization:
+  enabled: true
+  modes: ["YOLO_INT8"]
+  yolo_format: "auto"
+  yolo_data: null
+  yolo_fraction: 0.25
+  yolo_imgsz: 640
+  yolo_batch: 8
+  yolo_export_dir: "./results/yolo_exports_finetuned"
+  reuse_yolo_export: true
+  compute_detection_drift: true
+  num_calibration_batches: 50
+  calibration:
+    num_samples: null
+
+rectiq:
+  enabled: false
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_dir: "./logs"
+  wandb:
+    enabled: true
+    project: "quantization-decision-analysis"
+    entity: null
+    tags: ["quantization", "int8", "detection", "yolo", "bdd100k", "finetuned", "baseline"]
+    notes: "Baseline INT8 runtime export on BDD100K fine-tuned checkpoints (no Recti-Q)"
+
+output:
+  save_predictions: true
+  prediction_format: "pickle"
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  save_boxes: true
+  save_scores: true

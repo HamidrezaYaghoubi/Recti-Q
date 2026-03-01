@@ -291,11 +291,12 @@ def get_coco_loader(
     if task == "detection":
         collate_fn = detection_collate_fn
     
+    worker_count = config.num_workers if num_workers is None else int(num_workers)
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=config.shuffle,
-        num_workers=num_workers or config.num_workers,
+        num_workers=worker_count,
         pin_memory=config.pin_memory,
         drop_last=False,
         collate_fn=collate_fn,

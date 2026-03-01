@@ -104,6 +104,22 @@ python -m src.main --config configs/baseline_classification.yaml --no-wandb
 python -m src.main --config configs/baseline_imagenet_c.yaml
 ```
 
+### Run your detection experiments
+
+```bash
+# 1) Quantization on COCO (YOLO FP32 + INT8 export)
+python -m src.main --config configs/quantize_yolo.yaml
+
+# 2) Fine-tuning on BDD100K
+python -m src.finetune --config configs/finetune_bdd100k_yolo.yaml
+
+# 3) Quantization on BDD100K
+python -m src.main --config configs/quantize_bdd100k_yolo.yaml
+
+# 4) Recti-Q on BDD100K (runs quantization + Recti-Q phase when rectiq.enabled=true)
+python -m src.main --config configs/quantize_bdd100k_yolo_finetuned.yaml
+```
+
 ### Using shell scripts
 
 ```bash

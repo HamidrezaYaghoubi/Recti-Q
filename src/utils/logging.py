@@ -6,6 +6,7 @@ This module provides structured logging to console, files, and wandb.
 
 import logging
 import sys
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -115,6 +116,21 @@ def get_logger(name: str = "qda") -> logging.Logger:
     return logging.getLogger(name)
 
 
+def _sanitize_wandb_job_type(job_type: Optional[str]) -> Optional[str]:
+    """
+    Ensure WandB job_type stays within backend limits.
+
+    WandB enforces a 64-character limit for job_type.
+    """
+    if not job_type:
+        return job_type
+    if len(job_type) <= 64:
+        return job_type
+    suffix = hashlib.sha1(job_type.encode("utf-8")).hexdigest()[:8]
+    head_len = max(1, 64 - 1 - len(suffix))
+    return f"{job_type[:head_len]}_{suffix}"
+
+
 class WandbLogger:
     """
     Wrapper for Weights & Biases logging.
@@ -198,20 +214,34 @@ class WandbLogger:
             for tag in extra_tags:
                 if tag not in tags:
                     tags.append(tag)
-        
-        self._run = wandb.init(
-            project=wandb_config.project,
-            entity=wandb_config.entity,
-            name=run_name or self.config.name,
-            group=run_group,
-            job_type=run_job_type,
-            config=config_dict,
-            tags=tags,
-            notes=wandb_config.notes,
-            resume="allow" if resume else None,
-            id=run_id,
-            reinit=True,
-        )
+
+        safe_job_type = _sanitize_wandb_job_type(run_job_type)
+        init_kwargs = {
+            "project": wandb_config.project,
+            "entity": wandb_config.entity,
+            "name": run_name or self.config.name,
+            "group": run_group,
+            "job_type": safe_job_type,
+            "config": config_dict,
+            "tags": tags,
+            "notes": wandb_config.notes,
+            "resume": "allow" if resume else None,
+            "id": run_id,
+            "reinit": True,
+        }
+
+        try:
+            self._run = wandb.init(**init_kwargs)
+        except Exception as e:
+            msg = str(e)
+            if "64 limit exceeded for JobType" not in msg:
+                raise
+
+            self._logger.warning(
+                "WandB rejected job_type length; retrying run init without job_type."
+            )
+            init_kwargs["job_type"] = None
+            self._run = wandb.init(**init_kwargs)
         
         self._logger.info(f"Initialized wandb run: {self._run.name}")
     
