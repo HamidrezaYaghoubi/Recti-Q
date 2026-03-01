@@ -245,11 +245,12 @@ def get_imagenet_c_loader(
         dataset = SubsetDataset(dataset, debug_samples)
         logger.info(f"Debug mode: using {debug_samples} samples")
     
+    worker_count = config.num_workers if num_workers is None else int(num_workers)
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=config.shuffle,
-        num_workers=num_workers or config.num_workers,
+        num_workers=worker_count,
         pin_memory=config.pin_memory,
         drop_last=False,
     )
@@ -289,9 +290,10 @@ def get_all_imagenet_c_loaders(
         transform=transform,
     )
     
+    worker_count = config.num_workers if num_workers is None else int(num_workers)
     return multi_dataset.get_all_loaders(
         batch_size=config.batch_size,
-        num_workers=num_workers or config.num_workers,
+        num_workers=worker_count,
         pin_memory=config.pin_memory,
     )
 

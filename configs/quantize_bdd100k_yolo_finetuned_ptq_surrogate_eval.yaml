@@ -1,8 +1,14 @@
-# INT8 Quantization – Fine-tuned YOLO Detection Models on BDD100K
+# INT8 + PTQ-Surrogate Evaluation (No Recti-Q Training) on Fine-tuned YOLO
+#
+# Goal:
+#   - Build runtime-export INT8 artifact exactly as current pipeline.
+#   - Build PTQ-surrogate trainable student.
+#   - DO NOT train LoRA (epochs=0).
+#   - Evaluate PTQ-surrogate and log closeness vs runtime-export.
 
 experiment:
-  name: "quantize_bdd100k_yolo_finetuned"
-  description: "FP32 + INT8 export quantization for BDD100K fine-tuned YOLOv8"
+  name: "quantize_bdd100k_yolo_finetuned_ptq_surrogate_eval"
+  description: "INT8 export + PTQ-surrogate evaluation (no Recti-Q training) on BDD100K fine-tuned YOLOv8"
   seed: 42
   device: "cuda"
   num_workers: 4
@@ -41,7 +47,6 @@ quantization:
   yolo_imgsz: 640
   yolo_batch: 8
   yolo_export_dir: "./results/yolo_exports_finetuned"
-  # Keep false for first run when switching to new checkpoints.
   reuse_yolo_export: true
   compute_detection_drift: true
   num_calibration_batches: 50
@@ -49,33 +54,32 @@ quantization:
     num_samples: null
 
 rectiq:
+  # Must be true to activate PTQ-surrogate path in current pipeline.
   enabled: true
+  # Keep only Recti-Q phase run in wandb (no separate FP32/base INT8 phase runs here).
   only: true
+  # Skip base quantized evaluation; we only need PTQ-surrogate eval in this run.
   skip_base_quant_eval: true
-  # PTQ-only trainable student (fixed INT8 Q/DQ on Detect inputs).
-  # Keeps LoRA training differentiable without switching to QAT.
   student_backend: "ptq_surrogate"
-  use_teacher: true
+  # No LoRA training: evaluate raw PTQ-surrogate behavior.
+  epochs: 0
+  use_teacher: false
+  feature_kd_weight: 0.0
+  # Keep >0 for valid detection-loss signal definition in Recti-Q loop.
+  task_loss_weight: 1.0
   rank: 8
   alpha: 16.0
-  epochs: 3
   lr: 0.0003
   weight_decay: 0.0001
-  feature_kd_weight: 1.0
   residual_reg_weight: 0.0001
-  # Detection supervision term (YOLO box/cls/dfl loss) for Recti-Q adapter.
-  task_loss_weight: 1.0
-  # For teacher-free mode (lambda=0): set feature_kd_weight: 0.0 and use_teacher: false.
   train_split: "train"
   val_split: "val"
   train_batch_size: 8
   val_batch_size: 8
-  # Keep 0 to avoid worker-related crashes during adapter training.
   num_workers: 0
-  # If null, falls back to quantization.num_calibration_batches (or 50 default).
   ptq_calibration_batches: 50
   ptq_use_ste: true
-  # Pre-Recti-Q closeness check: runtime-export INT8 vs PTQ-surrogate student.
+  # This is your automatic double-check against runtime-export INT8.
   compare_to_runtime_export: true
   compare_max_batches: 20
   max_batches_per_epoch: null
@@ -90,8 +94,8 @@ logging:
     enabled: true
     project: "quantization-decision-analysis"
     entity: null
-    tags: ["quantization", "int8", "detection", "yolo", "bdd100k", "finetuned"]
-    notes: "YOLO INT8 export quantization on BDD100K fine-tuned checkpoints"
+    tags: ["quantization", "int8", "detection", "yolo", "bdd100k", "finetuned", "ptq-surrogate", "no-rectiq-train"]
+    notes: "INT8 export + PTQ-surrogate eval only (epochs=0, no LoRA training)"
 
 output:
   save_predictions: true
@@ -100,3 +104,4 @@ output:
   results_dir: "./results"
   save_boxes: true
   save_scores: true
+
