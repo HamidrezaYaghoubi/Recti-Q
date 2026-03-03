@@ -36,7 +36,7 @@ quantization:
   enabled: true
   modes: ["YOLO_INT8"]
   yolo_format: "auto"
-  yolo_data: null
+  yolo_data: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/bdd100k/data.yaml"
   yolo_fraction: 0.25
   yolo_imgsz: 640
   yolo_batch: 8
@@ -63,12 +63,21 @@ rectiq:
   feature_kd_weight: 0.0
   # Keep task supervision active
   task_loss_weight: 1.0
+  # Try earlier correction inside neck (one block before Detect-input producers).
+  adapter_target: "neck_pre_detect"
   rank: 8
+  rank_per_scale: [16, 16, 8]
   alpha: 16.0
-  epochs: 5
+  alpha_per_scale: [16.0, 16.0, 8.0]
+  epochs: 20
   lr: 0.0003
+  cv3_lr: 0.0001
   weight_decay: 0.0001
   residual_reg_weight: 0.0001
+  adapter_use_dwconv: true
+  adapter_dropout: 0.0
+  requantize_after_residual: true
+  unfreeze_detect_cv3: true
   train_split: "train"
   val_split: "val"
   train_batch_size: 64
@@ -80,6 +89,8 @@ rectiq:
   imgsz: 640
   ptq_calibration_batches: 50
   ptq_use_ste: true
+  recalibration_epoch: 2
+  recalibration_batches: 50
   # Disable student-closeness logging.
   compare_to_runtime_export: false
   compare_max_batches: 20

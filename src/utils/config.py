@@ -133,7 +133,9 @@ class RectiQConfig:
     # If true, skip base quantized-model evaluation before Recti-Q training/eval.
     skip_base_quant_eval: bool = False
     rank: int = 8
+    rank_per_scale: Optional[List[int]] = None
     alpha: float = 16.0
+    alpha_per_scale: Optional[List[float]] = None
     epochs: int = 3
     lr: float = 3e-4
     weight_decay: float = 1e-4
@@ -141,6 +143,10 @@ class RectiQConfig:
     residual_reg_weight: float = 1e-4
     # Detection supervision weight (native YOLO loss in Recti-Q training loop).
     task_loss_weight: float = 1.0
+    # Where to attach adapters:
+    # - detect_input: final Detect-input tensors
+    # - neck_pre_detect: one block earlier inside the neck
+    adapter_target: str = "detect_input"
     use_teacher: bool = True
     train_split: Optional[str] = None
     val_split: Optional[str] = None
@@ -158,6 +164,17 @@ class RectiQConfig:
     ptq_calibration_batches: Optional[int] = None
     # Use straight-through estimator through fixed Q/DQ during LoRA training.
     ptq_use_ste: bool = True
+    # Keep corrected features on quantized manifold: y=QDQ(QDQ(x)+delta).
+    requantize_after_residual: bool = True
+    # Adapter capacity options.
+    adapter_use_dwconv: bool = True
+    adapter_dropout: float = 0.0
+    # Optional selective unfreezing for detect classification branch.
+    unfreeze_detect_cv3: bool = False
+    cv3_lr: Optional[float] = None
+    # Optional scale recalibration after warmup epochs.
+    recalibration_epoch: Optional[int] = None
+    recalibration_batches: Optional[int] = None
     # Optional pre-training closeness report: runtime-export INT8 vs PTQ surrogate.
     compare_to_runtime_export: bool = True
     compare_max_batches: Optional[int] = 20
@@ -172,6 +189,11 @@ class RectiQConfig:
         val_bs = data.get("val_batch_size")
         imgsz = data.get("imgsz")
         ptq_calib_batches = data.get("ptq_calibration_batches")
+        rank_per_scale = data.get("rank_per_scale")
+        alpha_per_scale = data.get("alpha_per_scale")
+        cv3_lr = data.get("cv3_lr")
+        recalib_epoch = data.get("recalibration_epoch")
+        recalib_batches = data.get("recalibration_batches")
         compare_max_batches = data.get("compare_max_batches")
         return cls(
             enabled=bool(data.get("enabled", False)),
@@ -180,13 +202,24 @@ class RectiQConfig:
                 data.get("skip_base_quant_eval", data.get("skip_quant_eval", False))
             ),
             rank=int(data.get("rank", 8)),
+            rank_per_scale=(
+                [int(v) for v in rank_per_scale]
+                if isinstance(rank_per_scale, list) and len(rank_per_scale) > 0
+                else None
+            ),
             alpha=float(data.get("alpha", 16.0)),
+            alpha_per_scale=(
+                [float(v) for v in alpha_per_scale]
+                if isinstance(alpha_per_scale, list) and len(alpha_per_scale) > 0
+                else None
+            ),
             epochs=int(data.get("epochs", 3)),
             lr=float(data.get("lr", 3e-4)),
             weight_decay=float(data.get("weight_decay", 1e-4)),
             feature_kd_weight=float(data.get("feature_kd_weight", 1.0)),
             residual_reg_weight=float(data.get("residual_reg_weight", 1e-4)),
             task_loss_weight=float(data.get("task_loss_weight", 1.0)),
+            adapter_target=str(data.get("adapter_target", "detect_input")),
             use_teacher=bool(data.get("use_teacher", True)),
             train_split=data.get("train_split"),
             val_split=data.get("val_split"),
@@ -201,6 +234,15 @@ class RectiQConfig:
                 int(ptq_calib_batches) if ptq_calib_batches is not None else None
             ),
             ptq_use_ste=bool(data.get("ptq_use_ste", True)),
+            requantize_after_residual=bool(data.get("requantize_after_residual", True)),
+            adapter_use_dwconv=bool(data.get("adapter_use_dwconv", True)),
+            adapter_dropout=float(data.get("adapter_dropout", 0.0)),
+            unfreeze_detect_cv3=bool(data.get("unfreeze_detect_cv3", False)),
+            cv3_lr=(float(cv3_lr) if cv3_lr is not None else None),
+            recalibration_epoch=(int(recalib_epoch) if recalib_epoch is not None else None),
+            recalibration_batches=(
+                int(recalib_batches) if recalib_batches is not None else None
+            ),
             compare_to_runtime_export=bool(data.get("compare_to_runtime_export", True)),
             compare_max_batches=(
                 int(compare_max_batches) if compare_max_batches is not None else None

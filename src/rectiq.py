@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import weakref
 from types import SimpleNamespace
 
@@ -200,6 +200,143 @@ def _infer_detect_input_channels(detect_module: nn.Module) -> List[int]:
     if not channels:
         raise RuntimeError("No detect input channels inferred.")
     return channels
+
+
+def _get_yolo_layer_list(yolo_runtime: Any) -> List[nn.Module]:
+    """Return Ultralytics detection-model layer list (`model.model`)."""
+    model = getattr(yolo_runtime, "model", None)
+    layers = getattr(model, "model", None)
+    if isinstance(layers, nn.ModuleList):
+        return list(layers)
+    if isinstance(layers, nn.Sequential):
+        return list(layers)
+    if isinstance(layers, (list, tuple)) and all(isinstance(m, nn.Module) for m in layers):
+        return list(layers)
+    if isinstance(layers, nn.Module):
+        children = list(layers.children())
+        if children and all(isinstance(m, nn.Module) for m in children):
+            return children
+    raise RuntimeError("Could not resolve YOLO layer list from runtime model.")
+
+
+def _resolve_graph_indices(f_spec: Any, current_idx: int, n_layers: int) -> List[int]:
+    """
+    Resolve Ultralytics graph indices (`module.f`) to absolute non-negative indices.
+    """
+    if isinstance(f_spec, int):
+        raw = [f_spec]
+    elif isinstance(f_spec, (list, tuple)):
+        raw = [int(v) for v in f_spec]
+    else:
+        return []
+
+    resolved: List[int] = []
+    for ridx in raw:
+        aidx = current_idx + ridx if ridx < 0 else ridx
+        if 0 <= aidx < n_layers:
+            resolved.append(int(aidx))
+    return resolved
+
+
+def _infer_neck_pre_detect_indices(yolo_runtime: Any, detect_module: nn.Module) -> List[int]:
+    """
+    Infer one-block-earlier neck indices for each Detect input branch.
+
+    For each detect source index `s`, we resolve the producer module's own
+    inputs (`layers[s].f`) and take the first resolved input as the "earlier"
+    hook point. If it cannot be resolved, we fall back to `s`.
+    """
+    layers = _get_yolo_layer_list(yolo_runtime)
+    n_layers = len(layers)
+    detect_idx = next((i for i, m in enumerate(layers) if m is detect_module), -1)
+    if detect_idx < 0:
+        raise RuntimeError("Could not locate Detect module index in model graph.")
+
+    detect_sources = _resolve_graph_indices(getattr(detect_module, "f", []), detect_idx, n_layers)
+    if not detect_sources:
+        raise RuntimeError("Could not resolve Detect source indices from `Detect.f`.")
+
+    target_indices: List[int] = []
+    for src_idx in detect_sources:
+        src_module = layers[src_idx]
+        earlier = _resolve_graph_indices(getattr(src_module, "f", -1), src_idx, n_layers)
+        if earlier:
+            target_indices.append(int(earlier[0]))
+        else:
+            target_indices.append(int(src_idx))
+
+    if len(target_indices) != len(detect_sources):
+        raise RuntimeError("Failed inferring neck pre-detect hook indices.")
+    return target_indices
+
+
+def _infer_module_output_channels(
+    yolo_runtime: Any,
+    module_indices: Sequence[int],
+    device: str,
+    imgsz: int,
+) -> List[int]:
+    """
+    Infer output channels for selected YOLO graph modules using a dry forward.
+    """
+    model = getattr(yolo_runtime, "model", None)
+    if not isinstance(model, nn.Module):
+        raise RuntimeError("Channel inference requires a PyTorch YOLO backend.")
+    layers = _get_yolo_layer_list(yolo_runtime)
+    n_layers = len(layers)
+    indices = [int(i) for i in module_indices]
+    for i in indices:
+        if i < 0 or i >= n_layers:
+            raise RuntimeError(f"Module index out of range for channel inference: {i}")
+
+    outputs: List[Optional[int]] = [None for _ in indices]
+    handles: List[RemovableHandle] = []
+
+    def _make_hook(slot: int):
+        def _hook(_module: nn.Module, _inp: Tuple[Any, ...], out: Any):
+            t: Optional[Tensor] = None
+            if isinstance(out, torch.Tensor):
+                t = out
+            elif isinstance(out, (list, tuple)) and len(out) == 1 and isinstance(out[0], torch.Tensor):
+                t = out[0]
+            if t is not None and t.ndim >= 2:
+                outputs[slot] = int(t.shape[1])
+        return _hook
+
+    for slot, idx in enumerate(indices):
+        handles.append(layers[idx].register_forward_hook(_make_hook(slot)))
+
+    try:
+        model = model.to(device)
+        model.eval()
+        with torch.no_grad():
+            dummy = torch.zeros((1, 3, int(imgsz), int(imgsz)), device=device, dtype=torch.float32)
+            _ = model(dummy)
+    finally:
+        for h in handles:
+            h.remove()
+
+    channels: List[int] = []
+    for idx, ch in zip(indices, outputs):
+        if ch is None:
+            raise RuntimeError(f"Could not infer output channels for module index {idx}.")
+        channels.append(int(ch))
+    return channels
+
+
+def _resolve_rectiq_target_modules(
+    yolo_runtime: Any,
+    target_indices: Sequence[int],
+) -> List[nn.Module]:
+    """Resolve YOLO graph module indices to module objects."""
+    layers = _get_yolo_layer_list(yolo_runtime)
+    modules: List[nn.Module] = []
+    for idx in target_indices:
+        i = int(idx)
+        if i < 0 or i >= len(layers):
+            raise RuntimeError(f"Invalid Recti-Q target module index: {i}")
+        modules.append(layers[i])
+    return modules
 
 
 def _freeze_module(module: nn.Module) -> None:
@@ -531,31 +668,71 @@ def _detection_task_loss_from_ultralytics(
     return total_loss / float(batch_size)
 
 
+def _as_per_scale_list(
+    value: Union[int, float, Sequence[Union[int, float]]],
+    n_scales: int,
+    cast_type: type,
+    name: str,
+) -> List[Union[int, float]]:
+    """Normalize scalar/list config values to a per-scale list."""
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        out = [cast_type(v) for v in value]
+        if len(out) != n_scales:
+            raise ValueError(
+                f"{name} length mismatch: got {len(out)} values for {n_scales} detect scales."
+            )
+        return out
+    return [cast_type(value) for _ in range(n_scales)]
+
+
 class FeatureLoRA2d(nn.Module):
     """
     LoRA-style residual adapter for one feature map:
-      delta = up(down(x)) * (alpha / rank)
+      delta = up(dw(down(x))) * (alpha / rank)
     """
 
-    def __init__(self, channels: int, rank: int, alpha: float):
+    def __init__(
+        self,
+        channels: int,
+        rank: int,
+        alpha: float,
+        use_dwconv: bool = True,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive.")
+        if dropout < 0.0 or dropout >= 1.0:
+            raise ValueError(f"LoRA dropout must be in [0, 1). Got {dropout}.")
+
         self.channels = int(channels)
         self.rank = int(rank)
         self.alpha = float(alpha)
         self.scaling = self.alpha / float(self.rank)
+        self.use_dwconv = bool(use_dwconv)
 
         self.down = nn.Conv2d(self.channels, self.rank, kernel_size=1, bias=False)
+        self.dw = (
+            nn.Conv2d(self.rank, self.rank, kernel_size=3, stride=1, padding=1, groups=self.rank, bias=False)
+            if self.use_dwconv
+            else nn.Identity()
+        )
+        self.dropout = nn.Dropout2d(p=float(dropout)) if dropout > 0.0 else nn.Identity()
         self.up = nn.Conv2d(self.rank, self.channels, kernel_size=1, bias=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.down.weight, a=5 ** 0.5)
+        if isinstance(self.dw, nn.Conv2d):
+            nn.init.kaiming_uniform_(self.dw.weight, a=5 ** 0.5)
+        # Zero-init up-proj so initial residual is near zero.
         nn.init.zeros_(self.up.weight)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.up(self.down(x)) * self.scaling
+        y = self.down(x)
+        y = self.dw(y)
+        y = self.dropout(y)
+        return self.up(y) * self.scaling
 
 
 class RectiQPreDetectAdapter(nn.Module):
@@ -568,17 +745,46 @@ class RectiQPreDetectAdapter(nn.Module):
     for each detect scale i.
     """
 
-    def __init__(self, in_channels: Sequence[int], rank: int = 8, alpha: float = 16.0):
+    def __init__(
+        self,
+        in_channels: Sequence[int],
+        rank: Union[int, Sequence[int]] = 8,
+        alpha: Union[float, Sequence[float]] = 16.0,
+        use_dwconv: bool = True,
+        dropout: float = 0.0,
+        scales: Optional[Sequence[float]] = None,
+        use_ste: bool = True,
+        requantize_after_residual: bool = True,
+    ):
         super().__init__()
         self.in_channels = [int(c) for c in in_channels]
-        self.rank = int(rank)
-        self.alpha = float(alpha)
+        self.ranks = [int(v) for v in _as_per_scale_list(rank, len(self.in_channels), int, "rank")]
+        self.alphas = [float(v) for v in _as_per_scale_list(alpha, len(self.in_channels), float, "alpha")]
+        self.rank = self.ranks[0] if len(set(self.ranks)) == 1 else -1
+        self.alpha = self.alphas[0] if len(set(self.alphas)) == 1 else -1.0
+        self.use_ste = bool(use_ste)
+        self.requantize_after_residual = bool(requantize_after_residual)
+        self.scales: Optional[List[float]] = None
+        if scales is not None:
+            self.set_scales(scales)
+
         self.adapters = nn.ModuleList(
-            [FeatureLoRA2d(channels=c, rank=self.rank, alpha=self.alpha) for c in self.in_channels]
+            [
+                FeatureLoRA2d(
+                    channels=c,
+                    rank=r,
+                    alpha=a,
+                    use_dwconv=bool(use_dwconv),
+                    dropout=float(dropout),
+                )
+                for c, r, a in zip(self.in_channels, self.ranks, self.alphas)
+            ]
         )
 
         self._handle: Optional[RemovableHandle] = None
         self._detect_module_ref: Optional[weakref.ReferenceType[nn.Module]] = None
+        self._collect_absmax_enabled = False
+        self._collect_absmax: List[float] = [0.0 for _ in self.in_channels]
 
         # Cached tensors for loss computation.
         self.last_input_features: List[Tensor] = []
@@ -589,6 +795,28 @@ class RectiQPreDetectAdapter(nn.Module):
         self.last_input_features = []
         self.last_rectified_features = []
         self.last_residuals = []
+
+    def set_scales(self, scales: Sequence[float]) -> None:
+        vals = [float(max(s, 1e-8)) for s in scales]
+        if len(vals) != len(self.in_channels):
+            raise ValueError(
+                f"Scale length mismatch: got {len(vals)} scales for {len(self.in_channels)} feature maps."
+            )
+        self.scales = vals
+
+    def get_scales(self) -> Optional[List[float]]:
+        return list(self.scales) if self.scales is not None else None
+
+    def has_scales(self) -> bool:
+        return self.scales is not None
+
+    def start_absmax_collection(self) -> None:
+        self._collect_absmax_enabled = True
+        self._collect_absmax = [0.0 for _ in self.in_channels]
+
+    def finish_absmax_collection(self) -> List[float]:
+        self._collect_absmax_enabled = False
+        return list(self._collect_absmax)
 
     def attach(self, detect_module: nn.Module) -> None:
         if self._handle is not None:
@@ -635,14 +863,182 @@ class RectiQPreDetectAdapter(nn.Module):
         self.last_residuals = []
 
         rectified: List[Tensor] = []
-        for feat, adapter in zip(feats, self.adapters):
-            residual = adapter(feat)
-            rect = feat + residual
+        for idx, (feat, adapter) in enumerate(zip(feats, self.adapters)):
+            x = feat
+            if self.scales is not None:
+                x = _fixed_int8_qdq(x, scale=self.scales[idx], use_ste=self.use_ste)
+
+            residual = adapter(x)
+            rect = x + residual
+            if self._collect_absmax_enabled:
+                cur = float(rect.detach().abs().max().item())
+                if cur > self._collect_absmax[idx]:
+                    self._collect_absmax[idx] = cur
+
+            if self.scales is not None and self.requantize_after_residual:
+                rect = _fixed_int8_qdq(rect, scale=self.scales[idx], use_ste=self.use_ste)
+
             self.last_residuals.append(residual)
             self.last_rectified_features.append(rect)
             rectified.append(rect)
 
         return (rectified,) + tuple(inputs[1:])
+
+
+class RectiQModuleOutputAdapter(nn.Module):
+    """
+    Multi-scale LoRA residual adapter applied at selected YOLO module outputs.
+
+    This variant is used for "one block earlier" correction inside the neck.
+    """
+
+    def __init__(
+        self,
+        in_channels: Sequence[int],
+        target_module_indices: Sequence[int],
+        rank: Union[int, Sequence[int]] = 8,
+        alpha: Union[float, Sequence[float]] = 16.0,
+        use_dwconv: bool = True,
+        dropout: float = 0.0,
+        scales: Optional[Sequence[float]] = None,
+        use_ste: bool = True,
+        requantize_after_residual: bool = True,
+    ):
+        super().__init__()
+        self.in_channels = [int(c) for c in in_channels]
+        self.target_module_indices = [int(i) for i in target_module_indices]
+        if len(self.in_channels) != len(self.target_module_indices):
+            raise ValueError(
+                "RectiQModuleOutputAdapter mismatch: "
+                f"in_channels={len(self.in_channels)} vs targets={len(self.target_module_indices)}."
+            )
+
+        self.ranks = [int(v) for v in _as_per_scale_list(rank, len(self.in_channels), int, "rank")]
+        self.alphas = [float(v) for v in _as_per_scale_list(alpha, len(self.in_channels), float, "alpha")]
+        self.rank = self.ranks[0] if len(set(self.ranks)) == 1 else -1
+        self.alpha = self.alphas[0] if len(set(self.alphas)) == 1 else -1.0
+        self.use_ste = bool(use_ste)
+        self.requantize_after_residual = bool(requantize_after_residual)
+        self.scales: Optional[List[float]] = None
+        if scales is not None:
+            self.set_scales(scales)
+
+        self.adapters = nn.ModuleList(
+            [
+                FeatureLoRA2d(
+                    channels=c,
+                    rank=r,
+                    alpha=a,
+                    use_dwconv=bool(use_dwconv),
+                    dropout=float(dropout),
+                )
+                for c, r, a in zip(self.in_channels, self.ranks, self.alphas)
+            ]
+        )
+
+        self._handles: List[RemovableHandle] = []
+        self._target_refs: List[weakref.ReferenceType[nn.Module]] = []
+        self._collect_absmax_enabled = False
+        self._collect_absmax: List[float] = [0.0 for _ in self.in_channels]
+
+        self._last_input_slots: List[Optional[Tensor]] = [None for _ in self.in_channels]
+        self._last_rect_slots: List[Optional[Tensor]] = [None for _ in self.in_channels]
+        self._last_residual_slots: List[Optional[Tensor]] = [None for _ in self.in_channels]
+        self.last_input_features: List[Tensor] = []
+        self.last_rectified_features: List[Tensor] = []
+        self.last_residuals: List[Tensor] = []
+
+    def clear_cache(self) -> None:
+        self._last_input_slots = [None for _ in self.in_channels]
+        self._last_rect_slots = [None for _ in self.in_channels]
+        self._last_residual_slots = [None for _ in self.in_channels]
+        self.last_input_features = []
+        self.last_rectified_features = []
+        self.last_residuals = []
+
+    def set_scales(self, scales: Sequence[float]) -> None:
+        vals = [float(max(s, 1e-8)) for s in scales]
+        if len(vals) != len(self.in_channels):
+            raise ValueError(
+                f"Scale length mismatch: got {len(vals)} scales for {len(self.in_channels)} feature maps."
+            )
+        self.scales = vals
+
+    def get_scales(self) -> Optional[List[float]]:
+        return list(self.scales) if self.scales is not None else None
+
+    def has_scales(self) -> bool:
+        return self.scales is not None
+
+    def start_absmax_collection(self) -> None:
+        self._collect_absmax_enabled = True
+        self._collect_absmax = [0.0 for _ in self.in_channels]
+
+    def finish_absmax_collection(self) -> List[float]:
+        self._collect_absmax_enabled = False
+        return list(self._collect_absmax)
+
+    def attach(self, target_modules: Sequence[nn.Module]) -> None:
+        if self._handles:
+            return
+        if len(target_modules) != len(self.adapters):
+            raise RuntimeError(
+                f"Target/adapters mismatch: {len(target_modules)} modules vs {len(self.adapters)} adapters."
+            )
+
+        self._target_refs = [weakref.ref(m) for m in target_modules]
+        for i, module in enumerate(target_modules):
+            self._handles.append(module.register_forward_hook(self._make_hook(i)))
+
+    def remove(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+        self._target_refs = []
+
+    def _make_hook(self, idx: int):
+        def _hook(_module: nn.Module, _inputs: Tuple[Any, ...], output: Any):
+            out_tensor: Optional[Tensor] = None
+            wrap_kind = "tensor"
+            if isinstance(output, torch.Tensor):
+                out_tensor = output
+            elif isinstance(output, tuple) and len(output) == 1 and isinstance(output[0], torch.Tensor):
+                out_tensor = output[0]
+                wrap_kind = "tuple1"
+            elif isinstance(output, list) and len(output) == 1 and isinstance(output[0], torch.Tensor):
+                out_tensor = output[0]
+                wrap_kind = "list1"
+            else:
+                return output
+
+            x = out_tensor
+            if self.scales is not None:
+                x = _fixed_int8_qdq(x, scale=self.scales[idx], use_ste=self.use_ste)
+
+            residual = self.adapters[idx](x)
+            rect = x + residual
+            if self._collect_absmax_enabled:
+                cur = float(rect.detach().abs().max().item())
+                if cur > self._collect_absmax[idx]:
+                    self._collect_absmax[idx] = cur
+
+            if self.scales is not None and self.requantize_after_residual:
+                rect = _fixed_int8_qdq(rect, scale=self.scales[idx], use_ste=self.use_ste)
+
+            self._last_input_slots[idx] = x.detach()
+            self._last_rect_slots[idx] = rect
+            self._last_residual_slots[idx] = residual
+            self.last_input_features = [t for t in self._last_input_slots if t is not None]
+            self.last_rectified_features = [t for t in self._last_rect_slots if t is not None]
+            self.last_residuals = [t for t in self._last_residual_slots if t is not None]
+
+            if wrap_kind == "tuple1":
+                return (rect,)
+            if wrap_kind == "list1":
+                return [rect]
+            return rect
+
+        return _hook
 
 
 class DetectInputFeatureTap:
@@ -653,6 +1049,9 @@ class DetectInputFeatureTap:
     def __init__(self, detect_module: nn.Module):
         self.features: List[Tensor] = []
         self._handle = detect_module.register_forward_pre_hook(self._pre_hook)
+
+    def clear(self) -> None:
+        self.features = []
 
     def _pre_hook(self, _module: nn.Module, inputs: Tuple[Any, ...]) -> None:
         if not inputs:
@@ -668,6 +1067,43 @@ class DetectInputFeatureTap:
 
     def remove(self) -> None:
         self._handle.remove()
+
+
+class ModuleOutputFeatureTap:
+    """
+    Capture selected module outputs (one tensor per target module).
+    """
+
+    def __init__(self, target_modules: Sequence[nn.Module]):
+        self.features: List[Tensor] = []
+        self._slots: List[Optional[Tensor]] = [None for _ in target_modules]
+        self._handles: List[RemovableHandle] = []
+        for i, module in enumerate(target_modules):
+            self._handles.append(module.register_forward_hook(self._make_hook(i)))
+
+    def clear(self) -> None:
+        self.features = []
+        self._slots = [None for _ in self._slots]
+
+    def _make_hook(self, idx: int):
+        def _hook(_module: nn.Module, _inputs: Tuple[Any, ...], output: Any):
+            t: Optional[Tensor] = None
+            if isinstance(output, torch.Tensor):
+                t = output
+            elif isinstance(output, (tuple, list)) and len(output) == 1 and isinstance(output[0], torch.Tensor):
+                t = output[0]
+            if t is None:
+                return output
+            self._slots[idx] = t.detach()
+            self.features = [v for v in self._slots if v is not None]
+            return output
+
+        return _hook
+
+    def remove(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles = []
 
 
 def _feature_alignment_loss(student_feats: List[Tensor], teacher_feats: List[Tensor]) -> Tensor:
@@ -701,7 +1137,9 @@ def _residual_regularization(residuals: List[Tensor]) -> Tensor:
 @dataclass
 class RectiQConfig:
     rank: int = 8
+    rank_per_scale: Optional[List[int]] = None
     alpha: float = 16.0
+    alpha_per_scale: Optional[List[float]] = None
     imgsz: int = 640
     epochs: int = 5
     lr: float = 3e-4
@@ -709,13 +1147,29 @@ class RectiQConfig:
     feature_kd_weight: float = 1.0
     residual_reg_weight: float = 1e-4
     task_loss_weight: float = 1.0
+    # Where to attach adapters:
+    # - "detect_input": current detect-input features
+    # - "neck_pre_detect": one block earlier (producers of detect-input producers)
+    adapter_target: str = "detect_input"
+    # Adapter architecture / quantized interface behavior.
+    adapter_use_dwconv: bool = True
+    adapter_dropout: float = 0.0
+    requantize_after_residual: bool = True
+    ptq_scales: Optional[List[float]] = None
+    ptq_use_ste: bool = True
+    # Optional light head adaptation.
+    unfreeze_detect_cv3: bool = False
+    cv3_lr: Optional[float] = None
+    # Optional scale refresh after warmup.
+    recalibration_epoch: Optional[int] = None
+    recalibration_batches: Optional[int] = None
     max_batches_per_epoch: Optional[int] = None
     val_final_only: bool = False
 
 
 @dataclass
 class RectiQTrainResult:
-    adapter: RectiQPreDetectAdapter
+    adapter: nn.Module
     best_state_dict: Dict[str, Tensor]
     best_epoch: int
     best_val_loss: float
@@ -724,18 +1178,127 @@ class RectiQTrainResult:
 
 def attach_rectiq_adapter(
     quantized_model: Any,
-    rank: int = 8,
-    alpha: float = 16.0,
-) -> RectiQPreDetectAdapter:
+    rank: Union[int, Sequence[int]] = 8,
+    alpha: Union[float, Sequence[float]] = 16.0,
+    adapter_target: str = "detect_input",
+    imgsz: int = 640,
+    device: str = "cuda",
+    use_dwconv: bool = True,
+    dropout: float = 0.0,
+    scales: Optional[Sequence[float]] = None,
+    use_ste: bool = True,
+    requantize_after_residual: bool = True,
+) -> nn.Module:
     """
     Attach Recti-Q adapter to a quantized YOLO model and return the adapter.
     """
     q_yolo = _resolve_yolo_runtime(quantized_model)
     detect_module = _find_detect_module(q_yolo)
-    in_channels = _infer_detect_input_channels(detect_module)
-    adapter = RectiQPreDetectAdapter(in_channels=in_channels, rank=rank, alpha=alpha)
-    adapter.attach(detect_module)
+    target = str(adapter_target).strip().lower()
+    if target not in {"detect_input", "neck_pre_detect"}:
+        raise ValueError(
+            f"Unknown Recti-Q adapter_target='{adapter_target}'. "
+            "Use one of: detect_input, neck_pre_detect."
+        )
+
+    if target == "detect_input":
+        in_channels = _infer_detect_input_channels(detect_module)
+        adapter = RectiQPreDetectAdapter(
+            in_channels=in_channels,
+            rank=rank,
+            alpha=alpha,
+            use_dwconv=use_dwconv,
+            dropout=dropout,
+            scales=scales,
+            use_ste=use_ste,
+            requantize_after_residual=requantize_after_residual,
+        )
+        adapter.attach(detect_module)
+        setattr(adapter, "adapter_target", target)
+        return adapter
+
+    target_indices = _infer_neck_pre_detect_indices(q_yolo, detect_module)
+    target_modules = _resolve_rectiq_target_modules(q_yolo, target_indices)
+    in_channels = _infer_module_output_channels(
+        yolo_runtime=q_yolo,
+        module_indices=target_indices,
+        device=device,
+        imgsz=imgsz,
+    )
+    adapter = RectiQModuleOutputAdapter(
+        in_channels=in_channels,
+        target_module_indices=target_indices,
+        rank=rank,
+        alpha=alpha,
+        use_dwconv=use_dwconv,
+        dropout=dropout,
+        scales=scales,
+        use_ste=use_ste,
+        requantize_after_residual=requantize_after_residual,
+    )
+    adapter.attach(target_modules)
+    setattr(adapter, "adapter_target", target)
     return adapter
+
+
+def _enable_detect_cv3_training(yolo_runtime: Any) -> Tuple[List[nn.Module], List[nn.Parameter]]:
+    """
+    Unfreeze YOLO Detect classification branch (`cv3`) and return train modules/params.
+    """
+    detect_module = _find_detect_module(yolo_runtime)
+    cv3 = getattr(detect_module, "cv3", None)
+    if cv3 is None:
+        return [], []
+    modules = [cv3] if isinstance(cv3, nn.Module) else []
+    params: List[nn.Parameter] = []
+    for module in modules:
+        for p in module.parameters():
+            p.requires_grad_(True)
+            params.append(p)
+    return modules, params
+
+
+def recalibrate_rectiq_output_scales(
+    model_like: Any,
+    adapter: nn.Module,
+    source_loader: DataLoader,
+    device: str,
+    imgsz: int,
+    max_batches: Optional[int] = 50,
+) -> Dict[str, Any]:
+    """
+    Re-estimate per-scale quantization scales from adapter-corrected features.
+    """
+    yolo_runtime = _resolve_yolo_runtime(model_like)
+    model = getattr(yolo_runtime, "model", None)
+    if not isinstance(model, nn.Module):
+        raise RuntimeError("Scale recalibration requires a trainable PyTorch YOLO backend.")
+
+    model = model.to(device)
+    model.eval()
+    adapter.start_absmax_collection()
+    n_seen_batches = 0
+    try:
+        with torch.no_grad():
+            for batch_idx, (images, _targets) in enumerate(source_loader):
+                if max_batches is not None and batch_idx >= int(max_batches):
+                    break
+                batch = _as_bchw(images=images, device=device, imgsz=imgsz)
+                _ = model(batch)
+                n_seen_batches += 1
+    finally:
+        absmax = adapter.finish_absmax_collection()
+
+    scales = [max(v / 127.0, 1e-8) for v in absmax]
+    adapter.set_scales(scales)
+    return {
+        "scales": scales,
+        "absmax": absmax,
+        "num_features": len(scales),
+        "num_batches": n_seen_batches,
+        "quant_min": -128,
+        "quant_max": 127,
+    }
 
 
 def train_rectiq_adapter(
@@ -786,15 +1349,38 @@ def train_rectiq_adapter(
     q_model.eval()
     _freeze_module(q_model)
 
-    adapter = attach_rectiq_adapter(quantized_model=quantized_model, rank=cfg.rank, alpha=cfg.alpha)
+    rank_value: Union[int, Sequence[int]] = (
+        cfg.rank_per_scale if cfg.rank_per_scale is not None else cfg.rank
+    )
+    alpha_value: Union[float, Sequence[float]] = (
+        cfg.alpha_per_scale if cfg.alpha_per_scale is not None else cfg.alpha
+    )
+    adapter = attach_rectiq_adapter(
+        quantized_model=quantized_model,
+        rank=rank_value,
+        alpha=alpha_value,
+        adapter_target=str(getattr(cfg, "adapter_target", "detect_input")),
+        imgsz=int(cfg.imgsz),
+        device=device,
+        use_dwconv=bool(cfg.adapter_use_dwconv),
+        dropout=float(cfg.adapter_dropout),
+        scales=cfg.ptq_scales,
+        use_ste=bool(cfg.ptq_use_ste),
+        requantize_after_residual=bool(cfg.requantize_after_residual),
+    )
     # Adapter is created after q_model.to(device), so move it explicitly.
     adapter = adapter.to(device)
     for p in adapter.parameters():
         p.requires_grad_(True)
 
+    extra_train_modules: List[nn.Module] = []
+    extra_train_params: List[nn.Parameter] = []
+    if bool(cfg.unfreeze_detect_cv3):
+        extra_train_modules, extra_train_params = _enable_detect_cv3_training(q_yolo)
+
     use_teacher_kd = teacher_model is not None and float(cfg.feature_kd_weight) > 0.0
 
-    teacher_tap: Optional[DetectInputFeatureTap] = None
+    teacher_tap: Optional[Any] = None
     t_model: Optional[nn.Module] = None
     if use_teacher_kd:
         t_yolo = _resolve_yolo_runtime(teacher_model)
@@ -807,7 +1393,12 @@ def train_rectiq_adapter(
         t_model = t_model_raw.to(device)
         t_model.eval()
         _freeze_module(t_model)
-        teacher_tap = DetectInputFeatureTap(_find_detect_module(t_yolo))
+        if str(getattr(cfg, "adapter_target", "detect_input")).strip().lower() == "detect_input":
+            teacher_tap = DetectInputFeatureTap(_find_detect_module(t_yolo))
+        else:
+            target_indices = list(getattr(adapter, "target_module_indices", []))
+            teacher_target_modules = _resolve_rectiq_target_modules(t_yolo, target_indices)
+            teacher_tap = ModuleOutputFeatureTap(teacher_target_modules)
 
     has_task_signal = task_loss_fn is not None or float(cfg.task_loss_weight) > 0.0
     if not use_teacher_kd and not has_task_signal:
@@ -818,7 +1409,17 @@ def train_rectiq_adapter(
             "(3) task_loss_weight > 0 for native YOLO detection loss."
         )
 
-    optimizer = AdamW(adapter.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer_groups: List[Dict[str, Any]] = [
+        {"params": list(adapter.parameters()), "lr": float(cfg.lr)}
+    ]
+    if extra_train_params:
+        optimizer_groups.append(
+            {
+                "params": extra_train_params,
+                "lr": float(cfg.cv3_lr if cfg.cv3_lr is not None else cfg.lr),
+            }
+        )
+    optimizer = AdamW(optimizer_groups, weight_decay=cfg.weight_decay)
     history: List[Dict[str, float]] = []
     best_state: Dict[str, Tensor] = {k: v.detach().cpu().clone() for k, v in adapter.state_dict().items()}
     best_epoch = 0
@@ -827,8 +1428,12 @@ def train_rectiq_adapter(
     def _run_epoch(loader: DataLoader, training: bool) -> Dict[str, float]:
         if training:
             adapter.train()
+            for module in extra_train_modules:
+                module.train()
         else:
             adapter.eval()
+            for module in extra_train_modules:
+                module.eval()
 
         total_loss = 0.0
         total_feat = 0.0
@@ -846,6 +1451,8 @@ def train_rectiq_adapter(
 
             with torch.no_grad():
                 if t_model is not None and teacher_tap is not None:
+                    if hasattr(teacher_tap, "clear"):
+                        teacher_tap.clear()
                     _ = t_model(batch)
 
             if training:
@@ -914,6 +1521,25 @@ def train_rectiq_adapter(
     try:
         for epoch in range(1, cfg.epochs + 1):
             train_stats = _run_epoch(source_loader, training=True)
+            if (
+                cfg.recalibration_epoch is not None
+                and int(cfg.recalibration_epoch) > 0
+                and epoch == int(cfg.recalibration_epoch)
+                and adapter.has_scales()
+            ):
+                recalib_batches = (
+                    int(cfg.recalibration_batches)
+                    if cfg.recalibration_batches is not None
+                    else 50
+                )
+                _ = recalibrate_rectiq_output_scales(
+                    model_like=quantized_model,
+                    adapter=adapter,
+                    source_loader=source_loader,
+                    device=device,
+                    imgsz=cfg.imgsz,
+                    max_batches=recalib_batches,
+                )
             use_val_this_epoch = (
                 val_loader is not None
                 and (not cfg.val_final_only or epoch == cfg.epochs)
@@ -953,7 +1579,7 @@ def train_rectiq_adapter(
 
 
 def save_rectiq_adapter(
-    adapter: RectiQPreDetectAdapter,
+    adapter: nn.Module,
     save_path: str | Path,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Path:
@@ -963,9 +1589,14 @@ def save_rectiq_adapter(
     out = Path(save_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "adapter_target": str(getattr(adapter, "adapter_target", "detect_input")),
         "rank": adapter.rank,
+        "rank_per_scale": list(getattr(adapter, "ranks", [])),
         "alpha": adapter.alpha,
+        "alpha_per_scale": list(getattr(adapter, "alphas", [])),
         "in_channels": adapter.in_channels,
+        "target_module_indices": list(getattr(adapter, "target_module_indices", [])),
+        "ptq_scales": adapter.get_scales(),
         "state_dict": adapter.state_dict(),
         "extra": extra or {},
     }
@@ -974,7 +1605,7 @@ def save_rectiq_adapter(
 
 
 def load_rectiq_adapter(
-    adapter: RectiQPreDetectAdapter,
+    adapter: nn.Module,
     ckpt_path: str | Path,
     strict: bool = True,
 ) -> Dict[str, Any]:
@@ -984,4 +1615,9 @@ def load_rectiq_adapter(
     payload = torch.load(str(ckpt_path), map_location="cpu")
     state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
     adapter.load_state_dict(state_dict, strict=strict)
+    if isinstance(payload, dict) and payload.get("ptq_scales") is not None:
+        try:
+            adapter.set_scales(payload["ptq_scales"])
+        except Exception:
+            pass
     return payload if isinstance(payload, dict) else {"state_dict": state_dict}
