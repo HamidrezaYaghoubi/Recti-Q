@@ -1129,10 +1129,15 @@ def evaluate_rectiq_yolo_detection(
         "  Recti-Q setup: "
         f"dataset={dataset_name}, train_split={train_split}, val_split={val_split}, "
         f"student_backend={student_backend}, "
+        f"adapter_target={str(getattr(rectiq_cfg, 'adapter_target', 'detect_input')).strip().lower()}, "
         f"epochs={rectiq_cfg.epochs}, rank={rectiq_cfg.rank}, alpha={rectiq_cfg.alpha}, "
         f"batch(train/val)=({train_batch_size}/{val_batch_size}), workers={train_num_workers}, "
         f"feature_kd_weight={rectiq_cfg.feature_kd_weight}, task_loss_weight={rectiq_cfg.task_loss_weight}, "
-        f"use_teacher={bool(teacher_for_rectiq is not None)}"
+        f"use_teacher={bool(teacher_for_rectiq is not None)}, "
+        f"use_dwconv={bool(getattr(rectiq_cfg, 'adapter_use_dwconv', True))}, "
+        f"dropout={float(getattr(rectiq_cfg, 'adapter_dropout', 0.0))}, "
+        f"requantize_after_residual={bool(getattr(rectiq_cfg, 'requantize_after_residual', True))}, "
+        f"unfreeze_cv3={bool(getattr(rectiq_cfg, 'unfreeze_detect_cv3', False))}"
     )
 
     source_loader = _build_detection_loader_for_split(
@@ -1157,7 +1162,7 @@ def evaluate_rectiq_yolo_detection(
     if export_path_raw:
         export_path = Path(export_path_raw).resolve()
 
-    feature_quantizer = None
+    ptq_scales: Optional[List[float]] = None
     ptq_calibration_stats: Dict[str, Any] = {}
     student_closeness_stats: Dict[str, Any] = {}
 
@@ -1226,11 +1231,7 @@ def evaluate_rectiq_yolo_detection(
             imgsz=train_imgsz,
             max_batches=int(ptq_calib_batches),
         )
-        feature_quantizer = attach_fixed_int8_detect_input_quantizer(
-            model_like=quantized_backbone,
-            scales=ptq_calibration_stats["scales"],
-            use_ste=bool(rectiq_cfg.ptq_use_ste),
-        )
+        ptq_scales = list(ptq_calibration_stats.get("scales", []))
         text_logger.info(
             "  Recti-Q PTQ surrogate calibrated: "
             f"features={ptq_calibration_stats.get('num_features', 0)}, "
@@ -1244,7 +1245,15 @@ def evaluate_rectiq_yolo_detection(
                     "  [!] Skipping PTQ-student closeness report: runtime export_path is unavailable."
                 )
             else:
+                temp_quantizer = None
                 try:
+                    # For closeness diagnostics only, emulate the PTQ surrogate
+                    # without Recti-Q residuals by attaching fixed Q/DQ.
+                    temp_quantizer = attach_fixed_int8_detect_input_quantizer(
+                        model_like=quantized_backbone,
+                        scales=ptq_scales,
+                        use_ste=bool(rectiq_cfg.ptq_use_ste),
+                    )
                     runtime_export_yolo = YOLO(str(export_path), task="detect")
                     runtime_export_yolo.overrides.update(
                         {
@@ -1282,10 +1291,23 @@ def evaluate_rectiq_yolo_detection(
                     text_logger.warning(
                         f"  [!] PTQ-student closeness report failed for {model.name}: {e}"
                     )
+                finally:
+                    if temp_quantizer is not None:
+                        temp_quantizer.remove()
 
     rectiq_train_cfg = RectiQTrainConfig(
         rank=int(rectiq_cfg.rank),
+        rank_per_scale=(
+            [int(v) for v in rectiq_cfg.rank_per_scale]
+            if getattr(rectiq_cfg, "rank_per_scale", None)
+            else None
+        ),
         alpha=float(rectiq_cfg.alpha),
+        alpha_per_scale=(
+            [float(v) for v in rectiq_cfg.alpha_per_scale]
+            if getattr(rectiq_cfg, "alpha_per_scale", None)
+            else None
+        ),
         imgsz=train_imgsz,
         epochs=int(rectiq_cfg.epochs),
         lr=float(rectiq_cfg.lr),
@@ -1293,6 +1315,28 @@ def evaluate_rectiq_yolo_detection(
         feature_kd_weight=float(rectiq_cfg.feature_kd_weight),
         residual_reg_weight=float(rectiq_cfg.residual_reg_weight),
         task_loss_weight=float(rectiq_cfg.task_loss_weight),
+        adapter_target=str(getattr(rectiq_cfg, "adapter_target", "detect_input")),
+        adapter_use_dwconv=bool(getattr(rectiq_cfg, "adapter_use_dwconv", True)),
+        adapter_dropout=float(getattr(rectiq_cfg, "adapter_dropout", 0.0)),
+        requantize_after_residual=bool(getattr(rectiq_cfg, "requantize_after_residual", True)),
+        ptq_scales=(ptq_scales if student_backend == "ptq_surrogate" else None),
+        ptq_use_ste=bool(rectiq_cfg.ptq_use_ste),
+        unfreeze_detect_cv3=bool(getattr(rectiq_cfg, "unfreeze_detect_cv3", False)),
+        cv3_lr=(
+            float(rectiq_cfg.cv3_lr)
+            if getattr(rectiq_cfg, "cv3_lr", None) is not None
+            else None
+        ),
+        recalibration_epoch=(
+            int(rectiq_cfg.recalibration_epoch)
+            if getattr(rectiq_cfg, "recalibration_epoch", None) is not None
+            else None
+        ),
+        recalibration_batches=(
+            int(rectiq_cfg.recalibration_batches)
+            if getattr(rectiq_cfg, "recalibration_batches", None) is not None
+            else None
+        ),
         max_batches_per_epoch=(
             int(rectiq_cfg.max_batches_per_epoch)
             if rectiq_cfg.max_batches_per_epoch is not None
@@ -1403,11 +1447,25 @@ def evaluate_rectiq_yolo_detection(
             "base_quantized_size_mb": base_quantized_size_mb,
             "adapter_size_mb": adapter_size_mb,
             "rectiq_rank": int(rectiq_cfg.rank),
+            "rectiq_rank_per_scale": (
+                [int(v) for v in rectiq_cfg.rank_per_scale]
+                if getattr(rectiq_cfg, "rank_per_scale", None)
+                else []
+            ),
             "rectiq_alpha": float(rectiq_cfg.alpha),
+            "rectiq_alpha_per_scale": (
+                [float(v) for v in rectiq_cfg.alpha_per_scale]
+                if getattr(rectiq_cfg, "alpha_per_scale", None)
+                else []
+            ),
             "rectiq_epochs": int(rectiq_cfg.epochs),
             "rectiq_best_epoch": int(rectiq_result.best_epoch),
             "rectiq_best_val_loss": float(rectiq_result.best_val_loss),
             "rectiq_time_s": float(rectiq_time),
+            "rectiq_use_dwconv": bool(getattr(rectiq_cfg, "adapter_use_dwconv", True)),
+            "rectiq_adapter_dropout": float(getattr(rectiq_cfg, "adapter_dropout", 0.0)),
+            "rectiq_unfreeze_detect_cv3": bool(getattr(rectiq_cfg, "unfreeze_detect_cv3", False)),
+            "rectiq_adapter_target": str(getattr(rectiq_cfg, "adapter_target", "detect_input")),
             "rectiq_train_split": train_split,
             "rectiq_val_split": val_split,
             "rectiq_train_batch_size": train_batch_size,
@@ -1423,6 +1481,9 @@ def evaluate_rectiq_yolo_detection(
                 sum(ptq_calibration_stats.get("scales", [])) / max(len(ptq_calibration_stats.get("scales", [])), 1)
             )
             q_stats["ptq_use_ste"] = bool(rectiq_cfg.ptq_use_ste)
+            q_stats["ptq_requantize_after_residual"] = bool(
+                getattr(rectiq_cfg, "requantize_after_residual", True)
+            )
         if student_closeness_stats:
             for k, v in student_closeness_stats.items():
                 q_stats[f"student_closeness_{k}"] = float(v)
@@ -1456,9 +1517,12 @@ def evaluate_rectiq_yolo_detection(
                 )
 
         return metrics, q_stats, precision_label
-    finally:
-        if feature_quantizer is not None:
-            feature_quantizer.remove()
+    except QuantizationSkipped:
+        raise
+    except Exception as e:
+        raise QuantizationSkipped(
+            f"Recti-Q pipeline failed for {model.name} [{base_precision_label}] on {dataset_name}: {e}"
+        ) from e
 
 
 def evaluate_quantized_classification(

@@ -36,7 +36,7 @@ quantization:
   enabled: true
   modes: ["YOLO_INT8"]
   yolo_format: "auto"
-  yolo_data: null
+  yolo_data: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/bdd100k/data.yaml"
   yolo_fraction: 0.25
   yolo_imgsz: 640
   yolo_batch: 8
