@@ -197,11 +197,12 @@ def get_bdd100k_loader(
         dataset = SubsetDataset(dataset, debug_samples)
         logger.info(f"Debug mode: using {debug_samples} samples")
 
+    worker_count = config.num_workers if num_workers is None else int(num_workers)
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=config.shuffle,
-        num_workers=num_workers or config.num_workers,
+        num_workers=worker_count,
         pin_memory=config.pin_memory,
         drop_last=False,
         collate_fn=bdd_detection_collate_fn,

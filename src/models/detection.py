@@ -353,7 +353,10 @@ class YOLOWrapper(nn.Module):
         """
         import numpy as np
         outputs = []
-        
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+
+        processed_images = []
         for img in images:
             # Convert tensor to numpy if needed
             if isinstance(img, torch.Tensor):
@@ -364,36 +367,38 @@ class YOLOWrapper(nn.Module):
                 # Scale to 0-255 if in 0-1 range
                 if img.max() <= 1.0:
                     img = (img * 255).astype(np.uint8)
-            
-            # Use predict() method explicitly for inference-only mode
-            # Pass numpy array - YOLO handles resizing internally
-            results = self.yolo.predict(
-                source=img,  # numpy HWC format
-                verbose=False,
-                save=False,
-                save_txt=False,
-                save_conf=False,
-                save_crop=False,
-                show=False,
-                conf=0.001,  # Low threshold, filter later if needed
-                iou=0.7,
-            )
-            
-            for result in results:
-                boxes = result.boxes
-                if boxes is not None and len(boxes) > 0:
-                    outputs.append({
-                        "boxes": boxes.xyxy.cpu(),  # (N, 4) in xyxy format
-                        "scores": boxes.conf.cpu(),  # (N,) confidence scores
-                        "labels": boxes.cls.cpu().long(),  # (N,) class indices
-                    })
-                else:
-                    # No detections
-                    outputs.append({
-                        "boxes": torch.zeros((0, 4)),
-                        "scores": torch.zeros((0,)),
-                        "labels": torch.zeros((0,), dtype=torch.long),
-                    })
+
+            processed_images.append(img)
+
+        # Run one batched predict call instead of per-image calls.
+        # This is much more stable for TensorRT-backed models and faster.
+        results = self.yolo.predict(
+            source=processed_images,  # list of numpy HWC images
+            verbose=False,
+            save=False,
+            save_txt=False,
+            save_conf=False,
+            save_crop=False,
+            show=False,
+            conf=0.001,  # Low threshold, filter later if needed
+            iou=0.7,
+        )
+
+        for result in results:
+            boxes = result.boxes
+            if boxes is not None and len(boxes) > 0:
+                outputs.append({
+                    "boxes": boxes.xyxy.cpu(),  # (N, 4) in xyxy format
+                    "scores": boxes.conf.cpu(),  # (N,) confidence scores
+                    "labels": boxes.cls.cpu().long(),  # (N,) class indices
+                })
+            else:
+                # No detections
+                outputs.append({
+                    "boxes": torch.zeros((0, 4)),
+                    "scores": torch.zeros((0,)),
+                    "labels": torch.zeros((0,), dtype=torch.long),
+                })
         
         return outputs
 

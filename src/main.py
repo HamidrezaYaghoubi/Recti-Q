@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -45,7 +46,13 @@ from src.utils.formatting import (
     format_comparison_row,
 )
 from src.models import ModelFactory, BaseModel
-from src.datasets import get_imagenet_loader, get_imagenet_c_loader, get_all_imagenet_c_loaders
+from src.datasets import (
+    get_imagenet_loader,
+    get_imagenet_c_loader,
+    get_all_imagenet_c_loaders,
+    get_coco_loader,
+    get_bdd100k_loader,
+)
 from src.evaluation import MetricsComputer, ClassificationMetrics
 from src.quantization import quantize_model, QUANT_MODES, resolve_mode, get_model_size_mb
 
@@ -839,8 +846,19 @@ def evaluate_detection_quantization_drift(
 
     if dataset_name == "coco":
         dataset_config = config.get_dataset("coco")
+        drift_batch_size = int(dataset_config.batch_size)
+        yolo_batch = int(getattr(config.quantization, "yolo_batch", 0) or 0)
+        if yolo_batch > 0:
+            drift_batch_size = min(drift_batch_size, yolo_batch)
+        drift_dataset_config = replace(
+            dataset_config,
+            batch_size=drift_batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
         dataloader = get_coco_loader(
-            config=dataset_config,
+            config=drift_dataset_config,
             task="detection",
             num_workers=0,
             debug=config.debug,
@@ -849,8 +867,19 @@ def evaluate_detection_quantization_drift(
         remap_yolo_labels_to_coco = True
     elif dataset_name == "bdd100k":
         dataset_config = config.get_dataset("bdd100k")
+        drift_batch_size = int(dataset_config.batch_size)
+        yolo_batch = int(getattr(config.quantization, "yolo_batch", 0) or 0)
+        if yolo_batch > 0:
+            drift_batch_size = min(drift_batch_size, yolo_batch)
+        drift_dataset_config = replace(
+            dataset_config,
+            batch_size=drift_batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
         dataloader = get_bdd100k_loader(
-            config=dataset_config,
+            config=drift_dataset_config,
             task="detection",
             num_workers=0,
             debug=config.debug,
@@ -864,7 +893,9 @@ def evaluate_detection_quantization_drift(
 
     model_name = str(getattr(fp32_model, "name", "model"))
     text_logger.info(
-        f"  Computing decision drift on {dataset_name.upper()} [{precision_label}] (num_workers=0)..."
+        "  Computing decision drift on "
+        f"{dataset_name.upper()} [{precision_label}] "
+        f"(num_workers=0, pin_memory=false, batch_size={drift_batch_size})..."
     )
     drift_all = compute_detection_quantization_drift(
         fp32_model=fp32_model,
@@ -901,6 +932,598 @@ def evaluate_detection_quantization_drift(
     )
 
     return drift_metrics
+
+
+def evaluate_rectiq_student_closeness(
+    runtime_export_model: Any,
+    ptq_surrogate_model: Any,
+    config: ExperimentConfig,
+    logger: MetricsLogger,
+    text_logger,
+    dataset_name: str,
+    split: str,
+    batch_size: int,
+    num_workers: int,
+    max_batches: Optional[int],
+    tag: str,
+) -> Dict[str, float]:
+    """
+    Compare runtime-export INT8 vs PTQ-surrogate student before Recti-Q training.
+    """
+    from src.evaluation import compute_detection_quantization_drift
+
+    dataloader = _build_detection_loader_for_split(
+        config=config,
+        dataset_name=dataset_name,
+        split=split,
+        batch_size=batch_size,
+        num_workers=max(int(num_workers), 0),
+        shuffle=False,
+    )
+    remap_yolo_labels_to_coco = dataset_name == "coco"
+
+    text_logger.info(
+        "  Computing PTQ-student closeness vs runtime-export: "
+        f"dataset={dataset_name}, split={split}, batch={batch_size}, "
+        f"max_batches={max_batches}, tag={tag}"
+    )
+    closeness_all = compute_detection_quantization_drift(
+        fp32_model=runtime_export_model,
+        quantized_model=ptq_surrogate_model,
+        dataloader=dataloader,
+        device=config.device,
+        remap_yolo_labels_to_coco=remap_yolo_labels_to_coco,
+        max_batches=max_batches,
+        description=f"Student closeness - {tag}",
+    )
+
+    keys = [
+        "miss_rate",
+        "hallucination_rate",
+        "class_flip_rate",
+        "score_drift",
+        "box_drift",
+        "gt_conditioned_miss_rate",
+        "total_images",
+        "total_fp_detections",
+        "total_quantized_detections",
+        "total_matches",
+        "total_fp_gt_true_positives",
+        "total_gt_conditioned_misses",
+    ]
+    closeness_metrics = {k: float(closeness_all[k]) for k in keys if k in closeness_all}
+
+    logger.log({f"student_closeness_{k}": v for k, v in closeness_metrics.items()})
+    if getattr(logger, "wandb_logger", None) is not None:
+        logger.wandb_logger.log_summary(
+            {f"student_closeness_{k}": v for k, v in closeness_metrics.items()}
+        )
+
+    text_logger.info(
+        "  PTQ-student closeness summary: "
+        f"miss={closeness_metrics.get('miss_rate', 0.0):.4f}, "
+        f"hallucination={closeness_metrics.get('hallucination_rate', 0.0):.4f}, "
+        f"class_flip={closeness_metrics.get('class_flip_rate', 0.0):.4f}, "
+        f"score_drift={closeness_metrics.get('score_drift', 0.0):.4f}, "
+        f"box_drift={closeness_metrics.get('box_drift', 0.0):.4f}, "
+        f"gt_cond_miss={closeness_metrics.get('gt_conditioned_miss_rate', 0.0):.4f}"
+    )
+
+    return closeness_metrics
+
+
+def _default_detection_split(dataset_name: str, phase: str) -> str:
+    """
+    Return default split names for detection datasets.
+    """
+    if dataset_name == "coco":
+        return "train2017" if phase == "train" else "val2017"
+    if dataset_name == "bdd100k":
+        return "train" if phase == "train" else "val"
+    return "val"
+
+
+def _build_detection_loader_for_split(
+    config: ExperimentConfig,
+    dataset_name: str,
+    split: str,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool = False,
+) -> DataLoader:
+    """
+    Build a detection dataloader with explicit split/batch overrides.
+    """
+    dataset_cfg = config.get_dataset(dataset_name)
+    loader_cfg = replace(
+        dataset_cfg,
+        split=split,
+        batch_size=batch_size,
+        shuffle=shuffle,
+    )
+    if dataset_name == "coco":
+        return get_coco_loader(
+            config=loader_cfg,
+            task="detection",
+            num_workers=num_workers,
+            debug=config.debug,
+            debug_samples=config.debug_samples,
+        )
+    if dataset_name == "bdd100k":
+        return get_bdd100k_loader(
+            config=loader_cfg,
+            task="detection",
+            num_workers=num_workers,
+            debug=config.debug,
+            debug_samples=config.debug_samples,
+        )
+    raise QuantizationSkipped(
+        f"Recti-Q is not implemented for detection dataset '{dataset_name}'."
+    )
+
+
+def evaluate_rectiq_yolo_detection(
+    model: BaseModel,
+    config: ExperimentConfig,
+    checkpoint_manager: CheckpointManager,
+    logger: MetricsLogger,
+    text_logger,
+    dataset_name: str,
+    base_precision_label: str,
+    quant_stats: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+    """
+    Train and evaluate Recti-Q adapter on top of a quantized YOLO student.
+    """
+    from ultralytics import YOLO
+
+    from src.models.detection import YOLOWrapper
+    from src.rectiq import (
+        RectiQConfig as RectiQTrainConfig,
+        attach_fixed_int8_detect_input_quantizer,
+        calibrate_detect_input_ptq_scales,
+        save_rectiq_adapter,
+        train_rectiq_adapter,
+    )
+
+    if not _is_yolo_model(model):
+        raise QuantizationSkipped("Recti-Q is currently wired for YOLO-backed detection models only.")
+    if not config.rectiq.enabled:
+        raise QuantizationSkipped("Recti-Q is disabled in config (set rectiq.enabled=true).")
+
+    rectiq_cfg = config.rectiq
+    student_backend = str(getattr(rectiq_cfg, "student_backend", "ptq_surrogate")).strip().lower()
+    if student_backend in {"ptq", "pytorch_ptq"}:
+        student_backend = "ptq_surrogate"
+    if student_backend in {"runtime", "export"}:
+        student_backend = "runtime_export"
+    if student_backend not in {"ptq_surrogate", "runtime_export"}:
+        raise QuantizationSkipped(
+            f"Unknown Recti-Q student backend '{student_backend}'. "
+            "Use one of: ptq_surrogate, runtime_export."
+        )
+
+    teacher_for_rectiq = None
+    if rectiq_cfg.use_teacher and float(rectiq_cfg.feature_kd_weight) > 0.0:
+        teacher_for_rectiq = model
+    if teacher_for_rectiq is None and float(rectiq_cfg.task_loss_weight) <= 0.0:
+        raise QuantizationSkipped(
+            "Recti-Q has no active training signal. "
+            "Set rectiq.task_loss_weight > 0 for detection supervision "
+            "and/or enable teacher KD (rectiq.use_teacher=true, rectiq.feature_kd_weight>0)."
+        )
+
+    dataset_cfg = config.get_dataset(dataset_name)
+    train_split = rectiq_cfg.train_split or _default_detection_split(dataset_name, "train")
+    val_split = (
+        rectiq_cfg.val_split
+        or dataset_cfg.split
+        or _default_detection_split(dataset_name, "val")
+    )
+    train_batch_size = int(rectiq_cfg.train_batch_size or dataset_cfg.batch_size)
+    val_batch_size = int(rectiq_cfg.val_batch_size or dataset_cfg.batch_size)
+    train_num_workers = max(int(rectiq_cfg.num_workers), 0)
+    train_imgsz = int(rectiq_cfg.imgsz or config.quantization.yolo_imgsz)
+
+    text_logger.info(
+        "  Recti-Q setup: "
+        f"dataset={dataset_name}, train_split={train_split}, val_split={val_split}, "
+        f"student_backend={student_backend}, "
+        f"adapter_target={str(getattr(rectiq_cfg, 'adapter_target', 'detect_input')).strip().lower()}, "
+        f"epochs={rectiq_cfg.epochs}, rank={rectiq_cfg.rank}, alpha={rectiq_cfg.alpha}, "
+        f"batch(train/val)=({train_batch_size}/{val_batch_size}), workers={train_num_workers}, "
+        f"feature_kd_weight={rectiq_cfg.feature_kd_weight}, task_loss_weight={rectiq_cfg.task_loss_weight}, "
+        f"use_teacher={bool(teacher_for_rectiq is not None)}, "
+        f"use_dwconv={bool(getattr(rectiq_cfg, 'adapter_use_dwconv', True))}, "
+        f"dropout={float(getattr(rectiq_cfg, 'adapter_dropout', 0.0))}, "
+        f"requantize_after_residual={bool(getattr(rectiq_cfg, 'requantize_after_residual', True))}, "
+        f"unfreeze_cv3={bool(getattr(rectiq_cfg, 'unfreeze_detect_cv3', False))}"
+    )
+
+    source_loader = _build_detection_loader_for_split(
+        config=config,
+        dataset_name=dataset_name,
+        split=train_split,
+        batch_size=train_batch_size,
+        num_workers=train_num_workers,
+        shuffle=True,
+    )
+    val_loader = _build_detection_loader_for_split(
+        config=config,
+        dataset_name=dataset_name,
+        split=val_split,
+        batch_size=val_batch_size,
+        num_workers=train_num_workers,
+        shuffle=False,
+    )
+
+    export_path_raw = quant_stats.get("export_path")
+    export_path: Optional[Path] = None
+    if export_path_raw:
+        export_path = Path(export_path_raw).resolve()
+
+    ptq_scales: Optional[List[float]] = None
+    ptq_calibration_stats: Dict[str, Any] = {}
+    student_closeness_stats: Dict[str, Any] = {}
+
+    if student_backend == "runtime_export":
+        if export_path is None:
+            raise QuantizationSkipped(
+                "Recti-Q runtime_export backend requires quantized export_path, but none was found."
+            )
+        if not export_path.exists():
+            raise QuantizationSkipped(
+                f"Recti-Q export path does not exist: {export_path}"
+            )
+
+        quantized_yolo = YOLO(str(export_path), task="detect")
+        if not isinstance(getattr(quantized_yolo, "model", None), torch.nn.Module):
+            raise QuantizationSkipped(
+                "Recti-Q runtime_export backend is not trainable for this export. "
+                f"Export '{export_path}' uses inference-only runtime backend "
+                f"(model type: {type(getattr(quantized_yolo, 'model', None))}). "
+                "Use rectiq.student_backend='ptq_surrogate' for PTQ-style trainable student."
+            )
+        quantized_yolo.overrides.update(
+            {
+                "task": "detect",
+                "mode": "predict",
+                "data": None,
+                "verbose": False,
+            }
+        )
+        quantized_backbone = YOLOWrapper(quantized_yolo)
+    else:
+        # PTQ-trainable surrogate student:
+        # load the same source checkpoint as FP32 model, then attach fixed INT8 Q/DQ
+        # at Detect input features to emulate frozen PTQ behavior with gradients.
+        source_weights = _infer_yolo_source_weights_id(model)
+        if source_weights.startswith("builtin:"):
+            source_weights = f"{source_weights.split(':', 1)[1]}.pt"
+        quantized_yolo = YOLO(str(source_weights), task="detect")
+        if not isinstance(getattr(quantized_yolo, "model", None), torch.nn.Module):
+            raise QuantizationSkipped(
+                f"Recti-Q ptq_surrogate backend expected PyTorch YOLO model, got {type(getattr(quantized_yolo, 'model', None))}."
+            )
+        # Keep surrogate backend on the configured device for calibration/training.
+        quantized_yolo.model = quantized_yolo.model.to(config.device)
+        quantized_yolo.overrides.update(
+            {
+                "task": "detect",
+                "mode": "predict",
+                "data": None,
+                "verbose": False,
+            }
+        )
+        quantized_backbone = YOLOWrapper(quantized_yolo)
+
+        ptq_calib_batches = (
+            rectiq_cfg.ptq_calibration_batches
+            if rectiq_cfg.ptq_calibration_batches is not None
+            else config.quantization.num_calibration_batches
+        )
+        if ptq_calib_batches is None:
+            ptq_calib_batches = 50
+        ptq_calibration_stats = calibrate_detect_input_ptq_scales(
+            model_like=quantized_backbone,
+            source_loader=source_loader,
+            device=config.device,
+            imgsz=train_imgsz,
+            max_batches=int(ptq_calib_batches),
+        )
+        ptq_scales = list(ptq_calibration_stats.get("scales", []))
+        text_logger.info(
+            "  Recti-Q PTQ surrogate calibrated: "
+            f"features={ptq_calibration_stats.get('num_features', 0)}, "
+            f"batches={ptq_calibration_stats.get('num_batches', 0)}, "
+            f"use_ste={bool(rectiq_cfg.ptq_use_ste)}"
+        )
+
+        if bool(rectiq_cfg.compare_to_runtime_export):
+            if export_path is None or not export_path.exists():
+                text_logger.warning(
+                    "  [!] Skipping PTQ-student closeness report: runtime export_path is unavailable."
+                )
+            else:
+                temp_quantizer = None
+                try:
+                    # For closeness diagnostics only, emulate the PTQ surrogate
+                    # without Recti-Q residuals by attaching fixed Q/DQ.
+                    temp_quantizer = attach_fixed_int8_detect_input_quantizer(
+                        model_like=quantized_backbone,
+                        scales=ptq_scales,
+                        use_ste=bool(rectiq_cfg.ptq_use_ste),
+                    )
+                    runtime_export_yolo = YOLO(str(export_path), task="detect")
+                    runtime_export_yolo.overrides.update(
+                        {
+                            "task": "detect",
+                            "mode": "predict",
+                            "data": None,
+                            "verbose": False,
+                        }
+                    )
+                    runtime_export_backbone = YOLOWrapper(runtime_export_yolo)
+                    runtime_view = SimpleNamespace(
+                        name=f"{model.name}_runtime_export",
+                        backbone=runtime_export_backbone,
+                        _yolo=getattr(model, "_yolo", None),
+                    )
+                    surrogate_view = SimpleNamespace(
+                        name=f"{model.name}_ptq_surrogate",
+                        backbone=quantized_backbone,
+                        _yolo=getattr(model, "_yolo", None),
+                    )
+                    student_closeness_stats = evaluate_rectiq_student_closeness(
+                        runtime_export_model=runtime_view,
+                        ptq_surrogate_model=surrogate_view,
+                        config=config,
+                        logger=logger,
+                        text_logger=text_logger,
+                        dataset_name=dataset_name,
+                        split=val_split,
+                        batch_size=val_batch_size,
+                        num_workers=train_num_workers,
+                        max_batches=rectiq_cfg.compare_max_batches,
+                        tag=f"{model.name}:{dataset_name}:{base_precision_label}",
+                    )
+                except Exception as e:
+                    text_logger.warning(
+                        f"  [!] PTQ-student closeness report failed for {model.name}: {e}"
+                    )
+                finally:
+                    if temp_quantizer is not None:
+                        temp_quantizer.remove()
+
+    rectiq_train_cfg = RectiQTrainConfig(
+        rank=int(rectiq_cfg.rank),
+        rank_per_scale=(
+            [int(v) for v in rectiq_cfg.rank_per_scale]
+            if getattr(rectiq_cfg, "rank_per_scale", None)
+            else None
+        ),
+        alpha=float(rectiq_cfg.alpha),
+        alpha_per_scale=(
+            [float(v) for v in rectiq_cfg.alpha_per_scale]
+            if getattr(rectiq_cfg, "alpha_per_scale", None)
+            else None
+        ),
+        imgsz=train_imgsz,
+        epochs=int(rectiq_cfg.epochs),
+        lr=float(rectiq_cfg.lr),
+        weight_decay=float(rectiq_cfg.weight_decay),
+        feature_kd_weight=float(rectiq_cfg.feature_kd_weight),
+        residual_reg_weight=float(rectiq_cfg.residual_reg_weight),
+        task_loss_weight=float(rectiq_cfg.task_loss_weight),
+        adapter_target=str(getattr(rectiq_cfg, "adapter_target", "detect_input")),
+        adapter_use_dwconv=bool(getattr(rectiq_cfg, "adapter_use_dwconv", True)),
+        adapter_dropout=float(getattr(rectiq_cfg, "adapter_dropout", 0.0)),
+        requantize_after_residual=bool(getattr(rectiq_cfg, "requantize_after_residual", True)),
+        ptq_scales=(ptq_scales if student_backend == "ptq_surrogate" else None),
+        ptq_use_ste=bool(rectiq_cfg.ptq_use_ste),
+        unfreeze_detect_cv3=bool(getattr(rectiq_cfg, "unfreeze_detect_cv3", False)),
+        cv3_lr=(
+            float(rectiq_cfg.cv3_lr)
+            if getattr(rectiq_cfg, "cv3_lr", None) is not None
+            else None
+        ),
+        recalibration_epoch=(
+            int(rectiq_cfg.recalibration_epoch)
+            if getattr(rectiq_cfg, "recalibration_epoch", None) is not None
+            else None
+        ),
+        recalibration_batches=(
+            int(rectiq_cfg.recalibration_batches)
+            if getattr(rectiq_cfg, "recalibration_batches", None) is not None
+            else None
+        ),
+        max_batches_per_epoch=(
+            int(rectiq_cfg.max_batches_per_epoch)
+            if rectiq_cfg.max_batches_per_epoch is not None
+            else None
+        ),
+        val_final_only=bool(rectiq_cfg.val_final_only),
+    )
+
+    try:
+        t0 = time.time()
+        try:
+            rectiq_result = train_rectiq_adapter(
+                quantized_model=quantized_backbone,
+                source_loader=source_loader,
+                device=config.device,
+                config=rectiq_train_cfg,
+                teacher_model=teacher_for_rectiq,
+                val_loader=val_loader,
+                task_loss_fn=None,
+            )
+        except Exception as e:
+            raise QuantizationSkipped(
+                f"Recti-Q training failed for {model.name} [{base_precision_label}] on {dataset_name}: {e}"
+            ) from e
+        rectiq_time = time.time() - t0
+
+        adapter_out_dir = Path(
+            rectiq_cfg.output_dir or (Path(config.output.results_dir) / config.name / "rectiq_adapters")
+        )
+        adapter_out_dir.mkdir(parents=True, exist_ok=True)
+        safe_precision = base_precision_label.lower().replace("/", "_")
+        adapter_path = adapter_out_dir / f"{model.name}_{dataset_name}_{safe_precision}_rectiq.pt"
+        save_rectiq_adapter(
+            adapter=rectiq_result.adapter,
+            save_path=adapter_path,
+            extra={
+                "model_name": model.name,
+                "dataset_name": dataset_name,
+                "base_precision_label": base_precision_label,
+                "train_split": train_split,
+                "val_split": val_split,
+                "best_epoch": int(rectiq_result.best_epoch),
+                "best_val_loss": float(rectiq_result.best_val_loss),
+                "rectiq_time_s": float(rectiq_time),
+                "seed": int(config.seed),
+                "student_backend": student_backend,
+                "ptq_calibration": ptq_calibration_stats,
+            },
+        )
+
+        adapter_size_mb = adapter_path.stat().st_size / (1024 ** 2)
+        fallback_student_size = get_model_size_mb(quantized_yolo.model)
+        base_quantized_size_mb = float(
+            quant_stats.get("quantized_size_mb", quant_stats.get("original_size_mb", fallback_student_size))
+        )
+        effective_quantized_size_mb = base_quantized_size_mb + adapter_size_mb
+        original_size_mb = float(quant_stats.get("original_size_mb", effective_quantized_size_mb))
+        compression_ratio = original_size_mb / max(effective_quantized_size_mb, 1e-6)
+        size_reduction_pct = (1 - effective_quantized_size_mb / max(original_size_mb, 1e-6)) * 100.0
+
+        if rectiq_result.history:
+            final_row = rectiq_result.history[-1]
+            logger.log(
+                {
+                    "rectiq_best_epoch": float(rectiq_result.best_epoch),
+                    "rectiq_best_val_loss": float(rectiq_result.best_val_loss),
+                    "rectiq_final_train_loss": float(final_row["train_loss"]),
+                    "rectiq_final_val_loss": float(final_row["val_loss"]),
+                    "rectiq_time_s": float(rectiq_time),
+                }
+            )
+            if getattr(logger, "wandb_logger", None) is not None:
+                logger.wandb_logger.log_summary(
+                    {
+                        "rectiq_best_epoch": int(rectiq_result.best_epoch),
+                        "rectiq_best_val_loss": float(rectiq_result.best_val_loss),
+                        "rectiq_final_train_loss": float(final_row["train_loss"]),
+                        "rectiq_final_val_loss": float(final_row["val_loss"]),
+                        "rectiq_time_s": float(rectiq_time),
+                    }
+                )
+
+        precision_label = f"{base_precision_label}_RECTIQ"
+        original_backbone = model.backbone
+        model.backbone = quantized_backbone
+        try:
+            metrics = evaluate_model_on_detection_dataset(
+                model=model,
+                config=config,
+                checkpoint_manager=checkpoint_manager,
+                logger=logger,
+                text_logger=text_logger,
+                dataset_name=dataset_name,
+                precision=precision_label,
+            )
+        finally:
+            model.backbone = original_backbone
+
+        q_stats = {
+            "mode": "RECTIQ",
+            "mode_description": f"Recti-Q on top of {base_precision_label}",
+            "student_backend": student_backend,
+            "original_size_mb": original_size_mb,
+            "quantized_size_mb": effective_quantized_size_mb,
+            "compression_ratio": compression_ratio,
+            "size_reduction_pct": size_reduction_pct,
+            "target_layers": "YOLO Detect pre-input LoRA adapter",
+            "base_quantized_size_mb": base_quantized_size_mb,
+            "adapter_size_mb": adapter_size_mb,
+            "rectiq_rank": int(rectiq_cfg.rank),
+            "rectiq_rank_per_scale": (
+                [int(v) for v in rectiq_cfg.rank_per_scale]
+                if getattr(rectiq_cfg, "rank_per_scale", None)
+                else []
+            ),
+            "rectiq_alpha": float(rectiq_cfg.alpha),
+            "rectiq_alpha_per_scale": (
+                [float(v) for v in rectiq_cfg.alpha_per_scale]
+                if getattr(rectiq_cfg, "alpha_per_scale", None)
+                else []
+            ),
+            "rectiq_epochs": int(rectiq_cfg.epochs),
+            "rectiq_best_epoch": int(rectiq_result.best_epoch),
+            "rectiq_best_val_loss": float(rectiq_result.best_val_loss),
+            "rectiq_time_s": float(rectiq_time),
+            "rectiq_use_dwconv": bool(getattr(rectiq_cfg, "adapter_use_dwconv", True)),
+            "rectiq_adapter_dropout": float(getattr(rectiq_cfg, "adapter_dropout", 0.0)),
+            "rectiq_unfreeze_detect_cv3": bool(getattr(rectiq_cfg, "unfreeze_detect_cv3", False)),
+            "rectiq_adapter_target": str(getattr(rectiq_cfg, "adapter_target", "detect_input")),
+            "rectiq_train_split": train_split,
+            "rectiq_val_split": val_split,
+            "rectiq_train_batch_size": train_batch_size,
+            "rectiq_val_batch_size": val_batch_size,
+            "rectiq_adapter_path": str(adapter_path),
+        }
+        if export_path is not None:
+            q_stats["export_path"] = str(export_path)
+        if ptq_calibration_stats:
+            q_stats["ptq_calibration_batches"] = int(ptq_calibration_stats.get("num_batches", 0))
+            q_stats["ptq_num_features"] = int(ptq_calibration_stats.get("num_features", 0))
+            q_stats["ptq_scale_mean"] = float(
+                sum(ptq_calibration_stats.get("scales", [])) / max(len(ptq_calibration_stats.get("scales", [])), 1)
+            )
+            q_stats["ptq_use_ste"] = bool(rectiq_cfg.ptq_use_ste)
+            q_stats["ptq_requantize_after_residual"] = bool(
+                getattr(rectiq_cfg, "requantize_after_residual", True)
+            )
+        if student_closeness_stats:
+            for k, v in student_closeness_stats.items():
+                q_stats[f"student_closeness_{k}"] = float(v)
+
+        if config.quantization.compute_detection_drift:
+            fp32_view = SimpleNamespace(
+                name=model.name,
+                backbone=original_backbone,
+                _yolo=getattr(model, "_yolo", None),
+            )
+            rectiq_view = SimpleNamespace(
+                name=model.name,
+                backbone=quantized_backbone,
+                _yolo=getattr(model, "_yolo", None),
+            )
+            try:
+                drift_metrics = evaluate_detection_quantization_drift(
+                    fp32_model=fp32_view,
+                    quantized_model=rectiq_view,
+                    config=config,
+                    logger=logger,
+                    text_logger=text_logger,
+                    precision_label=precision_label,
+                    dataset_name=dataset_name,
+                )
+                for k, v in drift_metrics.items():
+                    q_stats[f"drift_{k}"] = float(v)
+            except Exception as e:
+                text_logger.warning(
+                    f"  [!] Decision drift failed for {model.name} [{precision_label}]: {e}"
+                )
+
+        return metrics, q_stats, precision_label
+    except QuantizationSkipped:
+        raise
+    except Exception as e:
+        raise QuantizationSkipped(
+            f"Recti-Q pipeline failed for {model.name} [{base_precision_label}] on {dataset_name}: {e}"
+        ) from e
+
 
 def evaluate_quantized_classification(
     model: BaseModel,
@@ -1543,6 +2166,7 @@ def evaluate_quantized_yolo_detection(
     text_logger,
     mode: str,
     dataset_name: str,
+    skip_eval: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     """
     Quantize YOLO via Ultralytics export (INT8) and evaluate on detection dataset.
@@ -1751,24 +2375,25 @@ def evaluate_quantized_yolo_detection(
                 f"INT8 {int8_layers}/{total_layers} ({int8_ratio:.1f}%), "
                 f"fallback {fallback_layers}/{total_layers} ({fallback_ratio:.1f}%)"
             )
-            quant_log_metrics = {
-                "total_layers": total_layers,
-                "int8_layers": int8_layers,
-                "fallback_layers": fallback_layers,
-                "int8_ratio": float(coverage["int8_ratio"]),
-                "fallback_ratio": float(coverage["fallback_ratio"]),
-            }
-            logger.log(quant_log_metrics)
-            if getattr(logger, "wandb_logger", None) is not None:
-                logger.wandb_logger.log_summary(
-                    {
-                        "total_layers": total_layers,
-                        "int8_layers": int8_layers,
-                        "fallback_layers": fallback_layers,
-                        "int8_ratio": float(coverage["int8_ratio"]),
-                        "fallback_ratio": float(coverage["fallback_ratio"]),
-                    }
-                )
+            if config.quantization.log_coverage_metrics:
+                quant_log_metrics = {
+                    "total_layers": total_layers,
+                    "int8_layers": int8_layers,
+                    "fallback_layers": fallback_layers,
+                    "int8_ratio": float(coverage["int8_ratio"]),
+                    "fallback_ratio": float(coverage["fallback_ratio"]),
+                }
+                logger.log(quant_log_metrics)
+                if getattr(logger, "wandb_logger", None) is not None:
+                    logger.wandb_logger.log_summary(
+                        {
+                            "total_layers": total_layers,
+                            "int8_layers": int8_layers,
+                            "fallback_layers": fallback_layers,
+                            "int8_ratio": float(coverage["int8_ratio"]),
+                            "fallback_ratio": float(coverage["fallback_ratio"]),
+                        }
+                    )
         else:
             text_logger.warning(
                 "  [!] Could not inspect TensorRT layer coverage: "
@@ -1796,25 +2421,32 @@ def evaluate_quantized_yolo_detection(
     )
     quantized_backbone = YOLOWrapper(quantized_yolo)
 
-    original_backbone = model.backbone
-    model.backbone = quantized_backbone
-    try:
-        metrics = evaluate_model_on_detection_dataset(
-            model=model,
-            config=config,
-            checkpoint_manager=checkpoint_manager,
-            logger=logger,
-            text_logger=text_logger,
-            dataset_name=dataset_name,
-            precision=precision_label,
+    metrics: Dict[str, Any] = {}
+    if skip_eval:
+        text_logger.info(
+            f"  Skipping base quantized evaluation for {model.name} [{precision_label}] "
+            "(rectiq.skip_base_quant_eval=true)"
         )
-    finally:
-        model.backbone = original_backbone
+    else:
+        original_backbone = model.backbone
+        model.backbone = quantized_backbone
+        try:
+            metrics = evaluate_model_on_detection_dataset(
+                model=model,
+                config=config,
+                checkpoint_manager=checkpoint_manager,
+                logger=logger,
+                text_logger=text_logger,
+                dataset_name=dataset_name,
+                precision=precision_label,
+            )
+        finally:
+            model.backbone = original_backbone
 
-    if config.quantization.compute_detection_drift:
+    if (not skip_eval) and config.quantization.compute_detection_drift:
         fp32_view = SimpleNamespace(
             name=model.name,
-            backbone=original_backbone,
+            backbone=model.backbone,
             _yolo=getattr(model, "_yolo", None),
         )
         quant_view = SimpleNamespace(
@@ -1855,6 +2487,7 @@ def evaluate_quantized_detection(
     text_logger,
     mode: str,
     dataset_name: str,
+    skip_eval: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     """
     Quantize a detection model and evaluate on one detection dataset.
@@ -1871,6 +2504,7 @@ def evaluate_quantized_detection(
             text_logger=text_logger,
             mode=mode,
             dataset_name=dataset_name,
+            skip_eval=skip_eval,
         )
 
     mode = resolve_mode(mode)
@@ -1894,20 +2528,24 @@ def evaluate_quantized_detection(
     original_module = model.backbone
     model.backbone = q_module
 
-    try:
-        metrics = evaluate_model_on_detection_dataset(
-            model=model,
-            config=config,
-            checkpoint_manager=checkpoint_manager,
-            logger=logger,
-            text_logger=text_logger,
-            dataset_name=dataset_name,
-            precision=mode,
-        )
-    finally:
+    if skip_eval:
+        metrics = {}
         model.backbone = original_module
+    else:
+        try:
+            metrics = evaluate_model_on_detection_dataset(
+                model=model,
+                config=config,
+                checkpoint_manager=checkpoint_manager,
+                logger=logger,
+                text_logger=text_logger,
+                dataset_name=dataset_name,
+                precision=mode,
+            )
+        finally:
+            model.backbone = original_module
 
-    if config.quantization.compute_detection_drift:
+    if (not skip_eval) and config.quantization.compute_detection_drift:
         fp32_view = SimpleNamespace(name=model.name, backbone=original_module)
         quant_view = SimpleNamespace(name=model.name, backbone=q_module)
         try:
@@ -2117,15 +2755,72 @@ def _build_wandb_phase_loggers(
     if dataset_name:
         job_tokens.append(_slugify_wandb_token(dataset_name))
     job_tokens.append(_slugify_wandb_token(precision))
+    raw_job_type = "_".join(job_tokens)
+    if len(raw_job_type) > 64:
+        # WandB enforces a 64-char job_type limit.
+        import hashlib
+
+        suffix = hashlib.sha1(raw_job_type.encode("utf-8")).hexdigest()[:8]
+        head_len = 64 - 1 - len(suffix)
+        raw_job_type = f"{raw_job_type[:head_len]}_{suffix}"
     wandb_logger = WandbLogger(
         config=config,
         run_name=run_name,
         run_group=run_group,
-        run_job_type="_".join(job_tokens),
+        run_job_type=raw_job_type,
         extra_tags=base_tags,
         extra_config=run_config,
     )
     return wandb_logger, MetricsLogger(config, wandb_logger)
+
+
+def _is_summary_metric_payload(metrics: Any) -> bool:
+    """
+    Return True if value looks like an evaluation metrics payload.
+    """
+    if hasattr(metrics, "top1_accuracy") and hasattr(metrics, "top5_accuracy"):
+        return True
+    if isinstance(metrics, dict):
+        metric_keys = {"mAP", "mAP50", "top1_accuracy", "top5_accuracy"}
+        return any(k in metrics for k in metric_keys)
+    return False
+
+
+def _select_summary_metrics_payload(precision_results: Any) -> Any:
+    """
+    Select one metrics payload for end-of-run summary.
+
+    Priority:
+      1) fp32 baseline (when present)
+      2) Recti-Q result
+      3) any other valid precision payload
+    """
+    if not isinstance(precision_results, dict):
+        return precision_results
+
+    fp32_metrics = precision_results.get("fp32")
+    if _is_summary_metric_payload(fp32_metrics):
+        return fp32_metrics
+
+    rectiq_candidates = []
+    other_candidates = []
+    for key, value in precision_results.items():
+        if not _is_summary_metric_payload(value):
+            continue
+        key_str = str(key).lower()
+        if "rectiq" in key_str:
+            rectiq_candidates.append((key_str, value))
+        else:
+            other_candidates.append((key_str, value))
+
+    if rectiq_candidates:
+        rectiq_candidates.sort(key=lambda x: x[0])
+        return rectiq_candidates[0][1]
+    if other_candidates:
+        other_candidates.sort(key=lambda x: x[0])
+        return other_candidates[0][1]
+
+    return {}
 
 
 def main():
@@ -2223,70 +2918,95 @@ def main():
         else:
             candidate_datasets = [ds for ds in datasets_to_eval if ds not in {"coco", "bdd100k"}]
         phase_dataset = candidate_datasets[0] if candidate_datasets else None
-        fp32_wandb_logger, fp32_metrics_logger = _build_wandb_phase_loggers(
-            config=config,
-            model_name=model_config.name,
-            task=model.task,
-            precision="fp32",
-            dataset_name=phase_dataset,
-        )
 
-        for dataset_name in datasets_to_eval:
-            if dataset_name not in config.datasets:
-                text_logger.warning(f"  [!] Dataset {dataset_name} not in config, skipping")
-                continue
-            
-            try:
-                if dataset_name == "imagenet":
-                    metrics = evaluate_model_on_imagenet(
-                        model=model,
-                        config=config,
-                        checkpoint_manager=checkpoint_manager,
-                        logger=fp32_metrics_logger,
-                        text_logger=text_logger,
-                    )
-                    fp32_results[dataset_name] = metrics
-                    all_results[model_config.name][dataset_name] = {"fp32": metrics}
-                    
-                elif dataset_name == "imagenet_c":
-                    metrics = evaluate_model_on_imagenet_c(
-                        model=model,
-                        config=config,
-                        checkpoint_manager=checkpoint_manager,
-                        logger=fp32_metrics_logger,
-                        text_logger=text_logger,
-                    )
-                    fp32_results[dataset_name] = metrics
-                    all_results[model_config.name][dataset_name] = {"fp32": metrics}
-                
-                elif dataset_name in {"coco", "bdd100k"}:
-                    metrics = evaluate_model_on_detection_dataset(
-                        model=model,
-                        config=config,
-                        checkpoint_manager=checkpoint_manager,
-                        logger=fp32_metrics_logger,
-                        text_logger=text_logger,
-                        dataset_name=dataset_name,
-                    )
-                    fp32_results[dataset_name] = metrics
-                    all_results[model_config.name][dataset_name] = {"fp32": metrics}
-                    
-                else:
+        rectiq_only_mode = (
+            model.task == "detection"
+            and _is_yolo_model(model)
+            and config.rectiq.enabled
+            and config.rectiq.only
+        )
+        skip_fp32_phase_mode = (
+            model.task == "detection"
+            and _is_yolo_model(model)
+            and config.quantization.skip_fp32_phase
+        )
+        fp32_wandb_logger: Optional[WandbLogger] = None
+        fp32_metrics_logger = MetricsLogger(config, None)
+
+        if rectiq_only_mode or skip_fp32_phase_mode:
+            reason = (
+                "Recti-Q only mode enabled"
+                if rectiq_only_mode
+                else "quantization.skip_fp32_phase=true"
+            )
+            text_logger.info(
+                f"  {reason}: skipping FP32 phase wandb run for this model."
+            )
+        else:
+            fp32_wandb_logger, fp32_metrics_logger = _build_wandb_phase_loggers(
+                config=config,
+                model_name=model_config.name,
+                task=model.task,
+                precision="fp32",
+                dataset_name=phase_dataset,
+            )
+
+            for dataset_name in datasets_to_eval:
+                if dataset_name not in config.datasets:
+                    text_logger.warning(f"  [!] Dataset {dataset_name} not in config, skipping")
+                    continue
+
+                try:
+                    if dataset_name == "imagenet":
+                        metrics = evaluate_model_on_imagenet(
+                            model=model,
+                            config=config,
+                            checkpoint_manager=checkpoint_manager,
+                            logger=fp32_metrics_logger,
+                            text_logger=text_logger,
+                        )
+                        fp32_results[dataset_name] = metrics
+                        all_results[model_config.name][dataset_name] = {"fp32": metrics}
+
+                    elif dataset_name == "imagenet_c":
+                        metrics = evaluate_model_on_imagenet_c(
+                            model=model,
+                            config=config,
+                            checkpoint_manager=checkpoint_manager,
+                            logger=fp32_metrics_logger,
+                            text_logger=text_logger,
+                        )
+                        fp32_results[dataset_name] = metrics
+                        all_results[model_config.name][dataset_name] = {"fp32": metrics}
+
+                    elif dataset_name in {"coco", "bdd100k"}:
+                        metrics = evaluate_model_on_detection_dataset(
+                            model=model,
+                            config=config,
+                            checkpoint_manager=checkpoint_manager,
+                            logger=fp32_metrics_logger,
+                            text_logger=text_logger,
+                            dataset_name=dataset_name,
+                        )
+                        fp32_results[dataset_name] = metrics
+                        all_results[model_config.name][dataset_name] = {"fp32": metrics}
+
+                    else:
+                        text_logger.warning(
+                            f"Dataset {dataset_name} not yet supported, skipping"
+                        )
+
+                except FileNotFoundError as e:
+                    text_logger.error(f"  [!] Dataset not found: {e}")
+                    continue
+                except QuantizationSkipped as e:
                     text_logger.warning(
-                        f"Dataset {dataset_name} not yet supported, skipping"
+                        f"  [!] Skipping baseline for {model_config.name} on {dataset_name}: {e}"
                     )
-                    
-            except FileNotFoundError as e:
-                text_logger.error(f"  [!] Dataset not found: {e}")
-                continue
-            except QuantizationSkipped as e:
-                text_logger.warning(
-                    f"  [!] Skipping baseline for {model_config.name} on {dataset_name}: {e}"
-                )
-                continue
-            except Exception as e:
-                text_logger.error(f"  [!] Error evaluating on {dataset_name}: {e}")
-                raise
+                    continue
+                except Exception as e:
+                    text_logger.error(f"  [!] Error evaluating on {dataset_name}: {e}")
+                    raise
         # ── Phase 2: Quantized Evaluation ──
         # Collect per-precision results for wandb comparison chart
         model_comparison = {}  # precision_key -> {"metrics": ..., "stats": ...}
@@ -2311,28 +3031,30 @@ def main():
         else:
             quant_target = model.backbone
 
-        fp32_size = get_model_size_mb(quant_target)
-        fp32_size_metrics = {"model_size_mb": float(fp32_size)}
-        fp32_metrics_logger.log(fp32_size_metrics)
-        if getattr(fp32_metrics_logger, "wandb_logger", None) is not None:
-            fp32_metrics_logger.wandb_logger.log_summary(
-                {
-                    "model_size_mb": fp32_size,
-                }
-            )
+        if not (rectiq_only_mode or skip_fp32_phase_mode):
+            fp32_size = get_model_size_mb(quant_target)
+            if config.logging.wandb.log_model_size:
+                fp32_size_metrics = {"model_size_mb": float(fp32_size)}
+                fp32_metrics_logger.log(fp32_size_metrics)
+                if getattr(fp32_metrics_logger, "wandb_logger", None) is not None:
+                    fp32_metrics_logger.wandb_logger.log_summary(
+                        {
+                            "model_size_mb": fp32_size,
+                        }
+                    )
 
-        if fp32_reference_metrics is not None:
-            model_comparison["FP32"] = {
-                "metrics": fp32_reference_metrics,
-                "stats": {
-                    "original_size_mb": fp32_size,
-                    "quantized_size_mb": fp32_size,
-                    "compression_ratio": 1.0,
-                    "size_reduction_pct": 0.0,
-                },
-            }
-        if fp32_wandb_logger:
-            fp32_wandb_logger.finish()
+            if fp32_reference_metrics is not None:
+                model_comparison["FP32"] = {
+                    "metrics": fp32_reference_metrics,
+                    "stats": {
+                        "original_size_mb": fp32_size,
+                        "quantized_size_mb": fp32_size,
+                        "compression_ratio": 1.0,
+                        "size_reduction_pct": 0.0,
+                    },
+                }
+            if fp32_wandb_logger:
+                fp32_wandb_logger.finish()
 
         if quant_enabled and quant_modes:
             for qmode in quant_modes:
@@ -2352,19 +3074,29 @@ def main():
                         yolo_mode = _resolve_yolo_quant_mode(run_mode)
                         yolo_format = _resolve_yolo_export_format(config)
                         phase_precision = f"{yolo_mode}_{yolo_format}".lower()
+                        if not config.rectiq.enabled:
+                            phase_precision = f"{phase_precision}_rectiq_disabled"
                     except Exception:
                         phase_precision = str(run_mode).lower()
                 else:
                     phase_precision = str(run_mode).lower()
-                q_wandb_logger, q_metrics_logger = _build_wandb_phase_loggers(
-                    config=config,
-                    model_name=model_config.name,
-                    task=model.task,
-                    precision=phase_precision,
-                    dataset_name=phase_dataset,
+                log_base_quant_run = not (
+                    rectiq_only_mode and model.task == "detection" and _is_yolo_model(model)
                 )
+                if log_base_quant_run:
+                    q_wandb_logger, q_metrics_logger = _build_wandb_phase_loggers(
+                        config=config,
+                        model_name=model_config.name,
+                        task=model.task,
+                        precision=phase_precision,
+                        dataset_name=phase_dataset,
+                    )
+                else:
+                    q_wandb_logger = None
+                    q_metrics_logger = MetricsLogger(config, None)
 
                 try:
+                    base_quant_metrics_available = True
                     if model.task == "classification":
                         q_metrics, q_stats = evaluate_quantized_classification(
                             model=model,
@@ -2396,6 +3128,11 @@ def main():
                                 f"using '{detection_datasets[0]}' for quantized evaluation."
                             )
                         detection_dataset = detection_datasets[0]
+                        skip_base_quant_eval = (
+                            config.rectiq.enabled
+                            and config.rectiq.skip_base_quant_eval
+                            and _is_yolo_model(model)
+                        )
 
                         q_metrics, q_stats, result_key = evaluate_quantized_detection(
                             model=model,
@@ -2405,13 +3142,22 @@ def main():
                             text_logger=text_logger,
                             mode=run_mode,
                             dataset_name=detection_dataset,
+                            skip_eval=skip_base_quant_eval,
                         )
 
-                        # Store results
-                        if detection_dataset in all_results[model_config.name]:
-                            all_results[model_config.name][detection_dataset][result_key] = q_metrics
+                        base_quant_metrics_available = not (
+                            isinstance(q_metrics, dict) and len(q_metrics) == 0
+                        )
+                        if base_quant_metrics_available:
+                            if detection_dataset in all_results[model_config.name]:
+                                all_results[model_config.name][detection_dataset][result_key] = q_metrics
+                            else:
+                                all_results[model_config.name][detection_dataset] = {result_key: q_metrics}
                         else:
-                            all_results[model_config.name][detection_dataset] = {result_key: q_metrics}
+                            text_logger.info(
+                                f"  Base quantized evaluation skipped for {model_config.name} [{result_key}] "
+                                "(rectiq.skip_base_quant_eval=true)."
+                            )
 
                     else:
                         text_logger.info(
@@ -2421,12 +3167,16 @@ def main():
                         continue
 
                     # Store for comparison chart
-                    model_comparison[result_key] = {
-                        "metrics": q_metrics,
-                        "stats": q_stats,
-                    }
+                    if base_quant_metrics_available:
+                        model_comparison[result_key] = {
+                            "metrics": q_metrics,
+                            "stats": q_stats,
+                        }
 
-                    if getattr(q_metrics_logger, "wandb_logger", None) is not None:
+                    if (
+                        config.logging.wandb.log_model_size
+                        and getattr(q_metrics_logger, "wandb_logger", None) is not None
+                    ):
                         q_size = q_stats.get(
                             "quantized_size_mb",
                             q_stats.get("original_size_mb", 0.0),
@@ -2440,7 +3190,11 @@ def main():
                         )
 
                     # Print comparison vs FP32
-                    if fp32_reference_metrics is not None and reference_dataset is not None:
+                    if (
+                        base_quant_metrics_available
+                        and fp32_reference_metrics is not None
+                        and reference_dataset is not None
+                    ):
                         comparison = format_comparison_row(
                             model_name=model_config.name,
                             dataset_name=reference_dataset,
@@ -2451,6 +3205,121 @@ def main():
                             quant_stats=q_stats,
                         )
                         print("\n" + comparison)
+
+                    if (
+                        model.task == "detection"
+                        and _is_yolo_model(model)
+                        and config.rectiq.enabled
+                    ):
+                        teacher_suffix = (
+                            "with_teacher"
+                            if config.rectiq.use_teacher and float(config.rectiq.feature_kd_weight) > 0.0
+                            else "without_teacher"
+                        )
+                        rectiq_phase_precision = (
+                            f"{result_key}_rectiq_enabled_{teacher_suffix}"
+                        ).lower()
+                        r_wandb_logger, r_metrics_logger = _build_wandb_phase_loggers(
+                            config=config,
+                            model_name=model_config.name,
+                            task=model.task,
+                            precision=rectiq_phase_precision,
+                            dataset_name=detection_dataset,
+                        )
+                        try:
+                            r_metrics, r_stats, r_result_key = evaluate_rectiq_yolo_detection(
+                                model=model,
+                                config=config,
+                                checkpoint_manager=checkpoint_manager,
+                                logger=r_metrics_logger,
+                                text_logger=text_logger,
+                                dataset_name=detection_dataset,
+                                base_precision_label=result_key,
+                                quant_stats=q_stats,
+                            )
+
+                            if detection_dataset in all_results[model_config.name]:
+                                all_results[model_config.name][detection_dataset][r_result_key] = r_metrics
+                            else:
+                                all_results[model_config.name][detection_dataset] = {r_result_key: r_metrics}
+
+                            model_comparison[r_result_key] = {
+                                "metrics": r_metrics,
+                                "stats": r_stats,
+                            }
+
+                            if (
+                                config.logging.wandb.log_model_size
+                                and getattr(r_metrics_logger, "wandb_logger", None) is not None
+                            ):
+                                r_size = r_stats.get(
+                                    "quantized_size_mb",
+                                    r_stats.get("original_size_mb", 0.0),
+                                )
+                                r_metrics_logger.log({"model_size_mb": float(r_size)})
+                                r_metrics_logger.wandb_logger.log_summary(
+                                    {"model_size_mb": float(r_size)}
+                                )
+
+                            if (
+                                config.quantization.log_coverage_metrics
+                                and getattr(r_metrics_logger, "wandb_logger", None) is not None
+                            ):
+                                # Recti-Q runs may skip base quant phase logging, so forward
+                                # INT8 runtime coverage from base quant stats into Recti-Q run.
+                                coverage_stats = r_stats
+                                if "total_layers" not in coverage_stats:
+                                    coverage_stats = q_stats
+                                coverage_keys = (
+                                    "total_layers",
+                                    "int8_layers",
+                                    "fallback_layers",
+                                    "int8_ratio",
+                                    "fallback_ratio",
+                                )
+                                coverage_payload = {
+                                    k: float(coverage_stats[k])
+                                    for k in coverage_keys
+                                    if k in coverage_stats
+                                }
+                                if coverage_payload:
+                                    r_metrics_logger.log(coverage_payload)
+                                    r_metrics_logger.wandb_logger.log_summary(
+                                        coverage_payload
+                                    )
+
+                            if fp32_reference_metrics is not None and reference_dataset is not None:
+                                rectiq_cmp = format_comparison_row(
+                                    model_name=model_config.name,
+                                    dataset_name=reference_dataset,
+                                    task=reference_task,
+                                    fp32_metrics=fp32_reference_metrics,
+                                    quant_metrics=r_metrics,
+                                    quant_mode=r_result_key,
+                                    quant_stats=r_stats,
+                                )
+                                print("\n" + rectiq_cmp)
+                        except QuantizationSkipped as e:
+                            if rectiq_only_mode:
+                                raise RuntimeError(
+                                    "Recti-Q only mode requested, but Recti-Q could not run: "
+                                    f"{e}"
+                                ) from e
+                            text_logger.warning(
+                                f"  [!] Skipping Recti-Q for {model_config.name} [{result_key}]: {e}"
+                            )
+                        except Exception as e:
+                            if rectiq_only_mode:
+                                raise RuntimeError(
+                                    "Recti-Q only mode requested, but Recti-Q crashed: "
+                                    f"{e}"
+                                ) from e
+                            text_logger.error(
+                                f"  [!] Error during Recti-Q for {model_config.name} [{result_key}]: {e}"
+                            )
+                        finally:
+                            if r_wandb_logger:
+                                r_wandb_logger.finish()
 
                 except QuantizationSkipped as e:
                     text_logger.warning(
@@ -2481,11 +3350,7 @@ def main():
     for mname, ds_dict in all_results.items():
         flat_results[mname] = {}
         for ds_name, prec_dict in ds_dict.items():
-            if isinstance(prec_dict, dict) and "fp32" in prec_dict:
-                # New nested format – use fp32 for top-level summary
-                flat_results[mname][ds_name] = prec_dict["fp32"]
-            else:
-                flat_results[mname][ds_name] = prec_dict
+            flat_results[mname][ds_name] = _select_summary_metrics_payload(prec_dict)
     
     summary = format_final_summary(flat_results, task_types)
     text_logger.info(summary)
