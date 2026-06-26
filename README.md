@@ -2,7 +2,7 @@
 
 **Investigating how neural network quantization alters model decisions in critical and edge cases**
 
-*Research project for ECCV 2026*
+*Research project for IROS 2026*
 
 ## Overview
 
