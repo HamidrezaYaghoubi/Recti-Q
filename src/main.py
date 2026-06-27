@@ -285,7 +285,8 @@ def run_imagenet_c(model_cfg: ModelConfig, exp: ExperimentConfig, text_logger) -
         imagenet_dcfg, model_name=model.name, transform=train_tf,
         num_workers=exp.rectiq.num_workers, debug=exp.debug, debug_samples=exp.debug_samples)
     ood_loaders = get_all_imagenet_c_loaders(
-        imagenet_c_dcfg, model_name=model.name, num_workers=exp.num_workers)
+        imagenet_c_dcfg, model_name=model.name, num_workers=exp.num_workers,
+        transform=eval_tf)
 
     max_combos = 2 if exp.debug else None
     eval_mb = 2 if exp.debug else None

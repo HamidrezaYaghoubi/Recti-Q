@@ -216,10 +216,11 @@ def get_imagenet_c_loader(
     num_workers: Optional[int] = None,
     debug: bool = False,
     debug_samples: int = 100,
+    transform: Optional[Callable] = None,
 ) -> DataLoader:
     """
     Create a DataLoader for a specific ImageNet-C corruption.
-    
+
     Args:
         config: Dataset configuration.
         corruption: Corruption type.
@@ -228,11 +229,14 @@ def get_imagenet_c_loader(
         num_workers: Number of data loading workers.
         debug: Whether to use a small subset.
         debug_samples: Number of samples in debug mode.
-        
+        transform: Optional eval transform; when None, falls back to
+            ``get_preprocessing_transform(model_name, is_training=False)``.
+
     Returns:
         DataLoader for ImageNet-C.
     """
-    transform = get_preprocessing_transform(model_name, is_training=False)
+    if transform is None:
+        transform = get_preprocessing_transform(model_name, is_training=False)
     
     dataset = ImageNetCDataset(
         root=config.root,
@@ -264,25 +268,29 @@ def get_all_imagenet_c_loaders(
     corruptions: Optional[List[str]] = None,
     severities: Optional[List[int]] = None,
     num_workers: Optional[int] = None,
+    transform: Optional[Callable] = None,
 ) -> Dict[Tuple[str, int], DataLoader]:
     """
     Create DataLoaders for all specified ImageNet-C corruptions.
-    
+
     Args:
         config: Dataset configuration.
         model_name: Model name for preprocessing.
         corruptions: List of corruption types (uses config if None).
         severities: List of severity levels (uses config if None).
         num_workers: Number of data loading workers.
-        
+        transform: Optional eval transform; when None, falls back to
+            ``get_preprocessing_transform(model_name, is_training=False)``.
+
     Returns:
         Dictionary mapping (corruption, severity) to DataLoader.
     """
     corruptions = corruptions or config.corruptions or ALL_CORRUPTIONS
     severities = severities or config.severities or SEVERITY_LEVELS
-    
-    transform = get_preprocessing_transform(model_name, is_training=False)
-    
+
+    if transform is None:
+        transform = get_preprocessing_transform(model_name, is_training=False)
+
     multi_dataset = ImageNetCMultiCorruption(
         root=config.root,
         corruptions=corruptions,
