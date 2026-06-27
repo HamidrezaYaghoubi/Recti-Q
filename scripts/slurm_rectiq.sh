@@ -19,7 +19,9 @@
 #SBATCH --partition=gamma
 #SBATCH --time=1-00:00:00
 
-set -euo pipefail
+# NOTE: no `-u` — conda's MKL activate.d script references an unbound variable,
+# which would abort the job under `set -u`.
+set -eo pipefail
 
 if [[ -n ${SLURM_SUBMIT_DIR:-} ]]; then
   ROOT_DIR="$SLURM_SUBMIT_DIR"
@@ -41,8 +43,8 @@ if [[ -f /etc/profile.d/modules.sh ]]; then
   source /etc/profile.d/modules.sh
 fi
 if command -v module >/dev/null 2>&1; then
-  module load cuda/12.6.3 || true
-  module load gcc/11.2.0 || true
+  module load cuda/12.6.3 2>/dev/null || true
+  module load gcc/11.2.0 2>/dev/null || true   # not on all nodes; torch ships its own runtime
 fi
 
 CONDA_ENV="${CONDA_ENV:-saficiency}"
