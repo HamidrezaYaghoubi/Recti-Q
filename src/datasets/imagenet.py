@@ -116,6 +116,7 @@ def get_imagenet_loader(
     num_workers: Optional[int] = None,
     debug: bool = False,
     debug_samples: int = 100,
+    transform: Optional[Callable] = None,
 ) -> DataLoader:
     """
     Create a DataLoader for ImageNet.
@@ -131,7 +132,8 @@ def get_imagenet_loader(
         DataLoader for ImageNet.
     """
     # Get the appropriate transform
-    transform = get_preprocessing_transform(model_name, is_training=False)
+    if transform is None:
+        transform = get_preprocessing_transform(model_name, is_training=False)
     
     # Create dataset
     split = config.split or "val"
@@ -162,6 +164,103 @@ def get_imagenet_loader(
         f"batch_size={config.batch_size}, num_workers={loader.num_workers}"
     )
     
+    return loader
+
+
+def get_imagenet_subset_loader(
+    config: DatasetConfig,
+    model_name: str = "resnet50",
+    transform: Optional[Callable] = None,
+    num_workers: Optional[int] = None,
+    debug: bool = False,
+    debug_samples: int = 100,
+) -> DataLoader:
+    """
+    Create a DataLoader for a class-balanced subset of ImageNet TRAIN.
+
+    Selects `config.subset_fraction` (default 0.05) of each class's images
+    using `config.subset_seed` for reproducibility, giving a 5% balanced
+    subsample (~64k images) suitable for Recti-Q adapter training.
+
+    Args:
+        config: Dataset configuration. Uses config.train_root if set; otherwise
+                derives <parent-of-config.root>/train (handles root pointing at
+                .../imagenet/validation).
+        model_name: Model name for default preprocessing transform.
+        transform: Override transform. If None, uses training augmentations.
+        num_workers: Override worker count; falls back to config.num_workers.
+        debug: Cap dataset to debug_samples for fast iteration.
+        debug_samples: Number of samples in debug mode.
+
+    Returns:
+        DataLoader with shuffled class-balanced subset.
+    """
+    import random
+    from collections import defaultdict
+    from torch.utils.data import Subset
+
+    # Resolve train root
+    if config.train_root:
+        train_root = Path(config.train_root)
+    else:
+        # config.root may point at .../imagenet/validation; go up one and find train
+        root_path = Path(config.root)
+        if root_path.name in ("validation", "val", "train"):
+            train_root = root_path.parent / "train"
+        else:
+            train_root = root_path / "train"
+
+    if not train_root.exists():
+        raise FileNotFoundError(f"ImageNet train directory not found: {train_root}")
+
+    # Load full train set (no transform yet — we apply after subset selection)
+    full_dataset = ImageFolder(str(train_root))
+
+    # Class-balanced sampling
+    fraction = config.subset_fraction if config.subset_fraction else 0.05
+    seed = config.subset_seed if config.subset_seed is not None else 42
+
+    # Group indices by class
+    class_to_indices: dict = defaultdict(list)
+    for idx, label in enumerate(full_dataset.targets):
+        class_to_indices[label].append(idx)
+
+    rng = random.Random(seed)
+    selected: List[int] = []
+    for label in sorted(class_to_indices.keys()):
+        indices = class_to_indices[label]
+        k = max(1, round(fraction * len(indices)))
+        chosen = rng.sample(indices, min(k, len(indices)))
+        selected.extend(chosen)
+
+    selected.sort()  # deterministic order before shuffle in DataLoader
+
+    # Apply transform
+    if transform is None:
+        transform = get_preprocessing_transform(model_name, is_training=True)
+    full_dataset.transform = transform
+
+    subset = Subset(full_dataset, selected)
+
+    # Debug cap
+    if debug:
+        subset = SubsetDataset(subset, debug_samples, shuffle=True, seed=seed)
+        logger.info(f"Debug mode: using {len(subset)} samples")
+
+    worker_count = config.num_workers if num_workers is None else int(num_workers)
+    loader = DataLoader(
+        subset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=worker_count,
+        pin_memory=config.pin_memory,
+        drop_last=True,
+    )
+
+    logger.info(
+        f"Created ImageNet subset loader: {len(subset)} samples "
+        f"({fraction*100:.1f}% balanced), batch_size={config.batch_size}"
+    )
     return loader
 
 

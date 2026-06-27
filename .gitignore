@@ -1,3 +1,6 @@
+# Paper submission PDF (source of truth, kept local; not pushed to remote)
+*.pdf
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

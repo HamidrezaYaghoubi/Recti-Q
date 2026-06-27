@@ -16,31 +16,25 @@ import torch.nn as nn
 @dataclass
 class ModelOutput:
     """
-    Standardized output format for all models.
-    
+    Standardized output format for classification models.
+
     Attributes:
-        predictions: Predicted class indices (classification) or boxes (detection).
-        logits: Raw model outputs before softmax/sigmoid.
-        probabilities: Softmax/sigmoid probabilities.
+        predictions: Predicted class indices.
+        logits: Raw model outputs before softmax.
+        probabilities: Softmax probabilities.
         confidences: Maximum probability for each prediction.
-        features: Optional intermediate features for analysis.
+        features: Optional pre-classifier features for analysis.
     """
     predictions: torch.Tensor
     logits: torch.Tensor
     probabilities: Optional[torch.Tensor] = None
     confidences: Optional[torch.Tensor] = None
     features: Optional[torch.Tensor] = None
-    
-    # Detection-specific fields
-    boxes: Optional[torch.Tensor] = None
-    scores: Optional[torch.Tensor] = None
-    labels: Optional[torch.Tensor] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         result = {}
-        for key in ["predictions", "logits", "probabilities", "confidences", 
-                    "features", "boxes", "scores", "labels"]:
+        for key in ["predictions", "logits", "probabilities", "confidences", "features"]:
             value = getattr(self, key)
             if value is not None:
                 result[key] = value.cpu() if isinstance(value, torch.Tensor) else value

@@ -1,0 +1,77 @@
+# Recti-Q on PACS (leave-one-domain-out): FP32 -> W4 PTQ -> Recti-Q adapter.
+# Per target domain: a short ERM base fine-tune on the 3 source domains produces the
+# FP32 base model; it is then W4-quantized and rectified with a source-only adapter.
+# target_domain: null => iterate over all four domains.
+
+experiment:
+  name: "pacs_rectiq"
+  description: "Recti-Q feature-space rectification on PACS LODO (W4 HQQ PTQ)"
+  seed: 42
+  device: "cuda"
+  num_workers: 8
+  debug: false
+  debug_samples: 200
+
+models:
+  - name: "resnet50"
+    architecture: "resnet50"
+    weights: "pretrained"
+    num_classes: 7
+  - name: "deit_tiny"
+    architecture: "deit_tiny_patch16_224"
+    weights: "pretrained"
+    num_classes: 7
+  - name: "deit_small"
+    architecture: "deit_small_patch16_224"
+    weights: "pretrained"
+    num_classes: 7
+  - name: "deit_base"
+    architecture: "deit_base_patch16_224"
+    weights: "pretrained"
+    num_classes: 7
+
+datasets:
+  pacs:
+    name: "pacs"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/pacs"
+    target_domain: null       # null => leave-one-out over all four domains
+    domains: null             # null => ["photo", "art_painting", "cartoon", "sketch"]
+    base_train_epochs: 30     # ERM source-domain fine-tune to build the FP32 base
+    base_lr: 0.0001
+    batch_size: 64
+    num_workers: 8
+    pin_memory: true
+
+quantization:
+  enabled: true
+  modes: ["W4"]
+  group_size: 128
+  use_hqq: true
+
+rectiq:
+  enabled: true
+  rank: 64
+  alpha: 16.0
+  kd_lambda: 1.0        # 0.0 => teacher-free (CE only)
+  temperature: 4.0
+  epochs: 10
+  lr: 0.0003
+  weight_decay: 0.0001
+  adapter_space: "feature"   # "logit" for the ablation baseline
+  num_workers: 8
+  output_dir: "./results/rectiq_adapters"
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_dir: "./logs"
+  wandb:
+    enabled: true
+    project: "recti-q"
+    entity: null
+    tags: ["recti-q", "pacs", "lodo", "w4", "hqq"]
+    notes: "Recti-Q on PACS leave-one-domain-out (W4 HQQ PTQ baseline)"
+
+output:
+  results_dir: "./results"
+  checkpoint_dir: "./checkpoints"

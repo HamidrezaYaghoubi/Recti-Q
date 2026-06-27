@@ -1,326 +1,190 @@
-# Quantization Decision Analysis
+# Recti-Q: Feature-Space Rectification for OOD-Robust Quantized Perception
 
-**Investigating how neural network quantization alters model decisions in critical and edge cases**
+**"Recti-Q: Feature-Space Rectification for Out-of-Distribution-Robust Quantized Perception in Edge Robotics"**
+*Accepted at IROS 2026*
 
-*Research project for IROS 2026*
+---
 
 ## Overview
 
-This project demonstrates that quantized models (INT8, INT4) maintain high average accuracy but exhibit systematic decision changes that disproportionately affect:
-- Edge cases and difficult examples
-- Small objects in detection tasks
-- Corrupted/noisy inputs
-- Underrepresented classes
+Deploying quantized neural networks on edge robots reduces memory and compute cost, but
+**4-bit Post-Training Quantization (PTQ) opens a Quantization-Induced Robustness Gap**: models
+maintain in-distribution (ID) accuracy while their out-of-distribution (OOD) robustness degrades
+substantially — a silent failure mode in safety-critical systems.
 
-## Requirements
+**Recti-Q** closes this gap with a small feature-space rectification adapter attached to the frozen
+quantized backbone. The adapter is a LoRA residual on pre-classifier features (`u`):
 
-- Python 3.10
-- CUDA 12.6
-- PyTorch 2.7.1
+```
+z = z_q + B(A(u)) · (α/r)
+```
+
+B is zero-initialized (so at init, Recti-Q is identical to the PTQ baseline). With rank r=64 and
+α=16, the adapter contains under 1% of model parameters — as small as 6 KB — while recovering the
+OOD robustness lost to quantization. Because only the adapter weights need to be transmitted, Recti-Q
+enables low-bandwidth Over-The-Air (OTA) model patching on resource-constrained robots.
+
+---
+
+## Method
+
+### Three configurations
+
+| Config | Description |
+|--------|-------------|
+| **FP32** | Full-precision baseline (upper bound) |
+| **PTQ-W4** | 4-bit weight-only PTQ via torchao HQQ (calibration-free); backbone frozen |
+| **Recti-Q** | PTQ-W4 backbone + LoRA adapter trained on pre-classifier features |
+
+### Models
+
+Image classification with `timm` pretrained models: `resnet50`, `deit_tiny_patch16_224`,
+`deit_small_patch16_224`, `deit_base_patch16_224`. The method is architecture-agnostic (CNN +
+Transformer).
+
+### Quantization
+
+4-bit weight-only via torchao `Int4WeightOnlyConfig(use_hqq=True)`. HQQ requires no calibration
+data. Only `nn.Linear` layers are quantized; the backbone is then frozen.
+
+### Training
+
+The adapter is trained source-only on a 5% class-balanced subsample of the ImageNet-1k *train*
+split. No OOD data is seen during training (leakage-free protocol).
+
+Loss: `L = L_CE + λ·L_KD` where KD distills from a frozen FP32 teacher at temperature T=4.
+Setting λ=0 gives the **teacher-free** variant (no FP32 teacher needed at deployment time).
+
+Optimizer: AdamW, lr=3e-4, wd=1e-4, cosine LR schedule.
+- ImageNet-C: 5 epochs, train batch 128, val/test batch 256.
+- PACS: 5–10 epochs (leave-one-domain-out).
+
+### Ablations
+
+- KD weight λ ∈ {0, 0.5, 1.0} — includes teacher-free setting.
+- Adapter space: feature-space (pre-classifier, ours) vs logit-space.
+- LoRA rank r ∈ {4, 8, 16, 32, 64}.
+
+---
+
+## Results
+
+Recti-Q recovers the OOD robustness lost to PTQ-W4 across corruption types (ImageNet-C) and
+domain shifts (PACS), while retaining more than 99% of PTQ's memory savings relative to FP32.
+Ablations confirm that feature-space rectification outperforms logit-space adaptation, and that
+higher LoRA rank (r=64) yields the best recovery. The teacher-free variant (λ=0) remains
+competitive, removing the need for a live FP32 model during deployment. See the paper tables for
+full quantitative results.
+
+---
 
 ## Installation
 
-### 1. Create conda environment
+**Requirements:** Python 3.10, CUDA 12.6, PyTorch 2.7.1
 
 ```bash
-conda create -n saficiency python=3.10
-conda activate saficiency
-```
+# Create and activate conda environment
+conda create -n quant python=3.10
+conda activate quant
 
-### 2. Install PyTorch with CUDA support
+# Install PyTorch with CUDA 12.6
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+    --index-url https://download.pytorch.org/whl/cu126
 
-```bash
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
-```
-
-### 3. Install project dependencies
-
-```bash
+# Install project dependencies
 pip install -r requirements.txt
 ```
 
-### 4. (Optional) Download COCO dataset
-
-```bash
-chmod +x scripts/download_coco.sh
-./scripts/download_coco.sh
-```
-
-## Project Structure
-
-```
-quantization-decision-analysis/
-├── configs/                    # Configuration files
-│   ├── baseline_classification.yaml
-│   ├── baseline_imagenet_c.yaml
-│   └── baseline_detection.yaml
-├── src/                        # Source code
-│   ├── models/                 # Model implementations
-│   │   ├── base.py            # Abstract base class
-│   │   ├── factory.py         # Model factory
-│   │   └── classification.py  # ResNet, MobileNet, ViT
-│   ├── datasets/              # Dataset loaders
-│   │   ├── imagenet.py        # ImageNet-1K
-│   │   ├── imagenet_c.py      # ImageNet-C (corruptions)
-│   │   └── coco.py            # COCO 2017
-│   ├── quantization/          # Quantization module (Week 2-3)
-│   │   └── quantizer.py       # Quantization implementation
-│   ├── evaluation/            # Evaluation metrics
-│   │   └── metrics.py         # Top-1, Top-5, decision changes
-│   ├── utils/                 # Utilities
-│   │   ├── config.py          # Configuration management
-│   │   ├── logging.py         # Logging with wandb
-│   │   └── checkpoint.py      # Checkpoint management
-│   └── main.py                # Main entry point
-├── scripts/                   # Shell scripts
-│   ├── run_baseline.sh        # Run baseline experiments
-│   ├── download_coco.sh       # Download COCO dataset
-│   └── slurm_run.sh          # SLURM cluster submission
-├── checkpoints/               # Saved model checkpoints
-├── results/                   # Experiment results
-├── logs/                      # Log files
-├── requirements.txt           # Python dependencies
-└── README.md                  # This file
-```
+---
 
 ## Quick Start
 
-### Run baseline FP32 inference on ImageNet
+All experiments are config-driven. The pipeline runs FP32 eval → PTQ-W4 eval → Recti-Q
+adapter training + eval for each model, logging each phase to wandb.
 
 ```bash
-# Full evaluation
-python -m src.main --config configs/baseline_classification.yaml
+# ImageNet-C benchmark (train on 5% ImageNet-1k, eval on corruptions)
+python -m src.main --config configs/imagenet_c_rectiq.yaml
 
-# Quick debug run (100 samples)
-python -m src.main --config configs/baseline_classification.yaml --debug
+# PACS benchmark (leave-one-domain-out)
+python -m src.main --config configs/pacs_rectiq.yaml
 
-# Without wandb logging
-python -m src.main --config configs/baseline_classification.yaml --no-wandb
+# Debug mode (small subset, fast sanity check)
+python -m src.main --config configs/imagenet_c_rectiq.yaml --debug
+
+# Disable wandb logging
+python -m src.main --config configs/imagenet_c_rectiq.yaml --no-wandb
 ```
 
-### Run evaluation on ImageNet-C
+### Cluster (UMIACS Nexus Gamma)
 
 ```bash
-python -m src.main --config configs/baseline_imagenet_c.yaml
+# Submit full pipeline as a batch job
+sbatch scripts/slurm_rectiq.sh
 ```
 
-### Run your detection experiments
+Partition: `gamma`, account: `gamma`. The script activates the `quant` conda env automatically.
 
-```bash
-# 1) Quantization on COCO (YOLO FP32 + INT8 export)
-python -m src.main --config configs/quantize_yolo.yaml
+---
 
-# 2) Fine-tuning on BDD100K
-python -m src.finetune --config configs/finetune_bdd100k_yolo.yaml
+## Dataset Layout
 
-# 3) Quantization on BDD100K
-python -m src.main --config configs/quantize_bdd100k_yolo.yaml
+Datasets live under `/fs/nexus-projects/pc_driving/yaghoubi/datasets/`:
 
-# 4) Recti-Q on BDD100K (runs quantization + Recti-Q phase when rectiq.enabled=true)
-python -m src.main --config configs/quantize_bdd100k_yolo_finetuned.yaml
-```
+| Dataset | Path | Used for |
+|---------|------|---------|
+| ImageNet-1K | `.../imagenet` | 5% training subsample |
+| ImageNet-C | `.../imagenet_c` | OOD eval (corruptions × severities) |
+| PACS | `.../pacs` | OOD eval (domain shift, LODO) |
 
-### Using shell scripts
+Paths are configurable per-dataset inside each YAML file.
 
-```bash
-# Make scripts executable
-chmod +x scripts/*.sh
+---
 
-# Run baseline
-./scripts/run_baseline.sh
-
-# Run in debug mode
-./scripts/run_baseline.sh --debug
-```
-
-### Submit to SLURM cluster
-
-```bash
-sbatch scripts/slurm_run.sh configs/baseline_classification.yaml
-```
-
-## Configuration
-
-Configuration files are in YAML format. Here's an example:
-
-```yaml
-experiment:
-  name: "baseline_classification"
-  seed: 42
-  device: "cuda"
-
-models:
-  - name: "resnet50"
-    architecture: "resnet50"
-    weights: "IMAGENET1K_V2"
-    task: "classification"
-    num_classes: 1000
-
-datasets:
-  imagenet:
-    root: "/path/to/imagenet"
-    split: "val"
-    batch_size: 64
-
-quantization:
-  enabled: false  # Enable for quantization experiments
-
-logging:
-  wandb:
-    enabled: true
-    project: "quantization-decision-analysis"
-
-output:
-  save_predictions: true
-  results_dir: "./results"
-```
-
-### Command-line overrides
-
-```bash
-# Override device
-python -m src.main --config configs/baseline_classification.yaml --device cpu
-
-# Evaluate specific models only
-python -m src.main --config configs/baseline_classification.yaml --models resnet50 vit_base
-
-# Evaluate specific datasets only
-python -m src.main --config configs/baseline_classification.yaml --datasets imagenet
-```
-
-## Adding New Models
-
-1. Create a new model class in `src/models/`:
-
-```python
-from src.models.base import BaseModel, ModelOutput
-from src.models.factory import register_model
-
-@register_model("my_model")
-class MyModel(BaseModel):
-    def __init__(self, weights: str = "DEFAULT", num_classes: int = 1000):
-        super().__init__("my_model", task="classification", num_classes=num_classes)
-        # Initialize your model...
-    
-    def forward(self, x):
-        # Forward pass...
-        pass
-    
-    def predict(self, x):
-        # Return ModelOutput...
-        pass
-    
-    def get_preprocessing_config(self):
-        return {"input_size": 224, "mean": [...], "std": [...]}
-```
-
-2. Add to config:
-
-```yaml
-models:
-  - name: "my_model"
-    architecture: "my_model"
-    weights: "DEFAULT"
-```
-
-## Adding New Datasets
-
-1. Create a dataset class in `src/datasets/`:
-
-```python
-from src.datasets.base import BaseDataset
-
-class MyDataset(BaseDataset):
-    def __init__(self, root, transform=None):
-        super().__init__(root, transform)
-        # Load your data...
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, index):
-        # Return (image, label)...
-        pass
-```
-
-2. Create a loader function:
-
-```python
-def get_my_dataset_loader(config, **kwargs):
-    # Create and return DataLoader...
-    pass
-```
-
-## Dataset Locations
-
-Default dataset paths (configurable in YAML):
-
-| Dataset | Path |
-|---------|------|
-| ImageNet-1K | `/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet` |
-| ImageNet-C | `/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet_c` |
-| COCO 2017 | `/fs/nexus-projects/pc_driving/yaghoubi/datasets/coco` |
-
-## Output Files
-
-Results are saved in the `results/` directory:
+## Repository Structure
 
 ```
-results/
-└── baseline_classification/
-    ├── resnet50_fp32_imagenet_20260203_120000.pkl      # Predictions
-    ├── metrics_resnet50_fp32_imagenet_20260203_120000.json  # Metrics
-    └── ...
+Recti-Q/
+├── configs/                    # YAML experiment configs
+├── src/
+│   ├── main.py                 # Pipeline entry point
+│   ├── rectiq.py               # ClassifierLoRA, RectiQModel, train_rectiq_adapter
+│   ├── models/
+│   │   ├── base.py             # BaseModel, ModelOutput
+│   │   ├── factory.py          # timm-backed ModelFactory and registry
+│   │   └── classification.py  # TimmClassifier, forward_features_logits
+│   ├── datasets/
+│   │   ├── imagenet.py         # ImageNet loader + 5% balanced subset
+│   │   ├── imagenet_c.py       # ImageNet-C corruption loader
+│   │   └── pacs.py             # PACS leave-one-domain-out splits
+│   ├── quantization/
+│   │   └── quantizer.py        # torchao PTQ (W4 = Int4WeightOnly HQQ)
+│   ├── evaluation/
+│   │   └── metrics.py          # MetricsComputer, ClassificationMetrics (top-1/5)
+│   └── utils/
+│       ├── config.py           # ExperimentConfig, QuantizationConfig, RectiQConfig
+│       └── logging.py          # wandb integration
+├── scripts/
+│   └── slurm_rectiq.sh         # Nexus Gamma batch job script
+├── requirements.txt
+└── Recti-Q IROS Submission.pdf # Accepted paper (source of truth)
 ```
 
-## Logging
-
-- **Console**: Colored output with progress bars
-- **File**: Detailed logs in `logs/`
-- **Weights & Biases**: Experiment tracking (optional)
-
-Configure wandb:
-```bash
-wandb login
-```
-
-Or disable:
-```bash
-python -m src.main --config ... --no-wandb
-```
-
-## Week 1 Features (Implemented)
-
-- [x] Project structure and configuration system
-- [x] Dataset loaders (ImageNet, ImageNet-C, COCO)
-- [x] Model interface with factory pattern
-- [x] Classification models (ResNet50, MobileNetV2, ViT-Base)
-- [x] Evaluation metrics (Top-1, Top-5 accuracy)
-- [x] Logging with wandb integration
-- [x] Checkpoint management
-- [x] Main inference pipeline
-
-## Week 2-4 Features (TODO)
-
-- [ ] Post-Training Quantization (PTQ) implementation
-- [ ] Calibration methods (MinMax, Percentile, Entropy)
-- [ ] Decision change analysis between FP32 and quantized models
-- [ ] Per-class and per-sample analysis
-- [ ] Object detection support
-- [ ] Visualization tools
-- [ ] Novel metrics for edge case detection
+---
 
 ## Citation
 
 ```bibtex
-@inproceedings{quantization-decision-analysis,
-  title={How Quantization Affects Neural Network Decisions: 
-         A Systematic Analysis of Edge Cases},
-  author={Your Name},
-  booktitle={European Conference on Computer Vision (ECCV)},
-  year={2026}
+@inproceedings{rectiq2026,
+  title     = {Recti-Q: Feature-Space Rectification for Out-of-Distribution-Robust
+               Quantized Perception in Edge Robotics},
+  author    = {Yaghoubi, Hamidreza and others},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2026}
 }
 ```
+
+---
 
 ## License
 

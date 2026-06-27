@@ -1,341 +1,149 @@
 """
-Classification models: ResNet, MobileNet, ViT.
+Classification models for Recti-Q (IROS 2026).
 
-This module provides concrete implementations of classification
-models with the BaseModel interface.
+Provides timm-based classification via TimmClassifier and the
+forward_features_logits() helper the Recti-Q adapter module uses.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torchvision.models as models
+import timm
+import timm.data
 
 from src.models.base import BaseModel, ModelOutput
 from src.models.factory import register_model
 from src.utils.logging import get_logger
 
-logger = get_logger("qda.models.classification")
+logger = get_logger("recti_q.models.classification")
+
+# Map short alias -> timm model name
+_TIMM_ARCH_MAP = {
+    "resnet50":              "resnet50",
+    "deit_tiny":             "deit_tiny_patch16_224",
+    "deit_small":            "deit_small_patch16_224",
+    "deit_base":             "deit_base_patch16_224",
+    "deit_tiny_patch16_224":  "deit_tiny_patch16_224",
+    "deit_small_patch16_224": "deit_small_patch16_224",
+    "deit_base_patch16_224":  "deit_base_patch16_224",
+}
+
+
+def forward_features_logits(backbone: nn.Module, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return (u, z) from a single forward pass through a timm backbone.
+
+    u : pre-classifier feature vector  (B, d)
+    z : logits                          (B, C)
+
+    Works on any timm model (fp32 or quantized copy).
+    """
+    feats = backbone.forward_features(x)
+    u = backbone.forward_head(feats, pre_logits=True)
+    z = backbone.forward_head(feats)
+    return u, z
 
 
 class ClassificationModel(BaseModel):
+    """Base class for classification models.
+
+    Holds self.backbone and provides forward / predict / get_preprocessing_config.
     """
-    Base class for classification models.
-    
-    Provides common functionality for all classification models.
-    """
-    
-    def __init__(
-        self,
-        name: str,
-        backbone: nn.Module,
-        num_classes: int = 1000,
-        preprocessing_config: Optional[Dict[str, Any]] = None,
-    ):
-        """
-        Initialize classification model.
-        
-        Args:
-            name: Model name.
-            backbone: The backbone neural network.
-            num_classes: Number of output classes.
-            preprocessing_config: Preprocessing configuration.
-        """
+
+    def __init__(self, name: str, backbone: nn.Module, num_classes: int = 1000):
         super().__init__(name, task="classification", num_classes=num_classes)
         self.backbone = backbone
-        self._preprocessing_config = preprocessing_config or {
-            "input_size": 224,
-            "mean": [0.485, 0.456, 0.406],
-            "std": [0.229, 0.224, 0.225],
-        }
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass returning logits."""
         return self.backbone(x)
-    
+
     def predict(self, x: torch.Tensor) -> ModelOutput:
-        """
-        Run inference and return structured output.
-        
-        Args:
-            x: Input tensor of shape (B, C, H, W).
-            
-        Returns:
-            ModelOutput with predictions, logits, probabilities, and confidences.
-        """
+        """Run inference and return structured ModelOutput."""
         with torch.no_grad():
             logits = self.forward(x)
-            probabilities = torch.softmax(logits, dim=-1)
-            confidences, predictions = probabilities.max(dim=-1)
-            
+            probs = torch.softmax(logits, dim=-1)
+            confidences, predictions = probs.max(dim=-1)
             return ModelOutput(
                 predictions=predictions,
                 logits=logits,
-                probabilities=probabilities,
+                probabilities=probs,
                 confidences=confidences,
             )
-    
+
     def get_preprocessing_config(self) -> Dict[str, Any]:
-        """Get preprocessing configuration."""
-        return self._preprocessing_config
-    
-    def get_top_k_predictions(
-        self, 
-        x: torch.Tensor, 
-        k: int = 5,
-    ) -> tuple:
-        """
-        Get top-k predictions for input.
-        
-        Args:
-            x: Input tensor.
-            k: Number of top predictions to return.
-            
-        Returns:
-            Tuple of (top_k_probs, top_k_indices).
-        """
-        with torch.no_grad():
-            logits = self.forward(x)
-            probabilities = torch.softmax(logits, dim=-1)
-            top_k_probs, top_k_indices = probabilities.topk(k, dim=-1)
-            return top_k_probs, top_k_indices
+        """Return preprocessing config dict (input_size, mean, std)."""
+        raise NotImplementedError("Subclasses must implement get_preprocessing_config")
 
 
-@register_model("resnet50")
-class ResNet50Model(ClassificationModel):
+class TimmClassifier(ClassificationModel):
+    """Wraps a timm pretrained model for Recti-Q classification.
+
+    Args:
+        name:          Logical model name (e.g. "resnet50").
+        architecture:  timm model name or short alias (see _TIMM_ARCH_MAP).
+        weights:       "pretrained" -> pretrained=True; "none"/"scratch"/"" -> False.
+        num_classes:   Number of output classes (passed to timm.create_model).
     """
-    ResNet-50 model for classification.
-    """
-    
+
     def __init__(
         self,
-        weights: str = "IMAGENET1K_V2",
+        name: str,
+        architecture: str,
+        weights: str = "pretrained",
         num_classes: int = 1000,
     ):
-        """
-        Initialize ResNet-50.
-        
-        Args:
-            weights: Pretrained weights name.
-            num_classes: Number of output classes.
-        """
-        # Get weights
-        if weights == "IMAGENET1K_V2":
-            weights_obj = models.ResNet50_Weights.IMAGENET1K_V2
-        elif weights == "IMAGENET1K_V1":
-            weights_obj = models.ResNet50_Weights.IMAGENET1K_V1
-        elif weights == "DEFAULT":
-            weights_obj = models.ResNet50_Weights.DEFAULT
-        else:
-            weights_obj = None
-        
-        # Create backbone
-        backbone = models.resnet50(weights=weights_obj)
-        
-        # Get preprocessing from weights
-        if weights_obj is not None:
-            transforms = weights_obj.transforms()
-            preprocess_config = {
-                "input_size": 224,
-                "mean": list(transforms.mean),
-                "std": list(transforms.std),
-            }
-        else:
-            preprocess_config = None
-        
-        super().__init__(
-            name="resnet50",
-            backbone=backbone,
-            num_classes=num_classes,
-            preprocessing_config=preprocess_config,
-        )
-        
-        logger.info(f"Initialized ResNet50 with weights: {weights}")
+        timm_name = _TIMM_ARCH_MAP.get(architecture.lower(), architecture)
+        pretrained = weights.lower() not in {"none", "scratch", ""}
 
+        backbone = timm.create_model(timm_name, pretrained=pretrained, num_classes=num_classes)
+        super().__init__(name=name, backbone=backbone, num_classes=num_classes)
 
-@register_model("resnet101")
-class ResNet101Model(ClassificationModel):
-    """ResNet-101 model for classification."""
-    
-    def __init__(
-        self,
-        weights: str = "IMAGENET1K_V2",
-        num_classes: int = 1000,
-    ):
-        if weights == "IMAGENET1K_V2":
-            weights_obj = models.ResNet101_Weights.IMAGENET1K_V2
-        elif weights == "IMAGENET1K_V1":
-            weights_obj = models.ResNet101_Weights.IMAGENET1K_V1
-        else:
-            weights_obj = models.ResNet101_Weights.DEFAULT
-        
-        backbone = models.resnet101(weights=weights_obj)
-        
-        transforms = weights_obj.transforms()
-        preprocess_config = {
-            "input_size": 224,
-            "mean": list(transforms.mean),
-            "std": list(transforms.std),
+        # Cache data config once
+        self._data_cfg = timm.data.resolve_model_data_config(self.backbone)
+
+        logger.info(f"TimmClassifier: {timm_name}, pretrained={pretrained}, num_classes={num_classes}")
+
+    @property
+    def classifier_dims(self) -> Tuple[int, int]:
+        """Return (d, C): in_features and out_features of the classifier head."""
+        clf = self.backbone.get_classifier()
+        if hasattr(clf, "in_features") and hasattr(clf, "out_features"):
+            return clf.in_features, clf.out_features
+        # Fallback: timm exposes num_features for the backbone output dim
+        return self.backbone.num_features, self._num_classes
+
+    def build_transform(self, train: bool = False):
+        """Return the timm eval or train transform for this model."""
+        return timm.data.create_transform(**self._data_cfg, is_training=train)
+
+    def get_preprocessing_config(self) -> Dict[str, Any]:
+        """Return dict with input_size, mean, std from the timm data config."""
+        cfg = self._data_cfg
+        return {
+            "input_size": cfg.get("input_size", (3, 224, 224)),
+            "mean": list(cfg.get("mean", (0.485, 0.456, 0.406))),
+            "std": list(cfg.get("std", (0.229, 0.224, 0.225))),
         }
-        
-        super().__init__(
-            name="resnet101",
-            backbone=backbone,
-            num_classes=num_classes,
-            preprocessing_config=preprocess_config,
-        )
 
 
-@register_model("mobilenetv2")
-@register_model("mobilenet_v2")
-class MobileNetV2Model(ClassificationModel):
-    """
-    MobileNetV2 model for classification.
-    
-    Efficient model suitable for mobile/edge deployment.
-    """
-    
-    def __init__(
-        self,
-        weights: str = "IMAGENET1K_V1",
-        num_classes: int = 1000,
-    ):
-        """
-        Initialize MobileNetV2.
-        
-        Args:
-            weights: Pretrained weights name.
-            num_classes: Number of output classes.
-        """
-        if weights == "IMAGENET1K_V2":
-            weights_obj = models.MobileNet_V2_Weights.IMAGENET1K_V2
-        elif weights == "IMAGENET1K_V1":
-            weights_obj = models.MobileNet_V2_Weights.IMAGENET1K_V1
-        else:
-            weights_obj = models.MobileNet_V2_Weights.DEFAULT
-        
-        backbone = models.mobilenet_v2(weights=weights_obj)
-        
-        transforms = weights_obj.transforms()
-        preprocess_config = {
-            "input_size": 224,
-            "mean": list(transforms.mean),
-            "std": list(transforms.std),
-        }
-        
-        super().__init__(
-            name="mobilenetv2",
-            backbone=backbone,
-            num_classes=num_classes,
-            preprocessing_config=preprocess_config,
-        )
-        
-        logger.info(f"Initialized MobileNetV2 with weights: {weights}")
+# ── Register the four paper models ──
+# ModelFactory.create() will call the builder registered here.
+
+def _timm_builder(name: str, architecture: str):
+    """Return a builder that ModelFactory can call with (weights, num_classes)."""
+    def builder(weights: str = "pretrained", num_classes: int = 1000) -> TimmClassifier:
+        return TimmClassifier(name=name, architecture=architecture, weights=weights, num_classes=num_classes)
+    return builder
 
 
-@register_model("vit_base")
-@register_model("vit_b_16")
-class ViTBaseModel(ClassificationModel):
-    """
-    Vision Transformer (ViT-B/16) model for classification.
-    """
-    
-    def __init__(
-        self,
-        weights: str = "IMAGENET1K_V1",
-        num_classes: int = 1000,
-    ):
-        """
-        Initialize ViT-Base/16.
-        
-        Args:
-            weights: Pretrained weights name.
-            num_classes: Number of output classes.
-        """
-        if weights == "IMAGENET1K_SWAG_E2E_V1":
-            weights_obj = models.ViT_B_16_Weights.IMAGENET1K_SWAG_E2E_V1
-        elif weights == "IMAGENET1K_SWAG_LINEAR_V1":
-            weights_obj = models.ViT_B_16_Weights.IMAGENET1K_SWAG_LINEAR_V1
-        elif weights == "IMAGENET1K_V1":
-            weights_obj = models.ViT_B_16_Weights.IMAGENET1K_V1
-        else:
-            weights_obj = models.ViT_B_16_Weights.DEFAULT
-        
-        backbone = models.vit_b_16(weights=weights_obj)
-        
-        transforms = weights_obj.transforms()
-        preprocess_config = {
-            "input_size": 224,
-            "mean": list(transforms.mean),
-            "std": list(transforms.std),
-        }
-        
-        super().__init__(
-            name="vit_base",
-            backbone=backbone,
-            num_classes=num_classes,
-            preprocessing_config=preprocess_config,
-        )
-        
-        logger.info(f"Initialized ViT-Base/16 with weights: {weights}")
-
-
-@register_model("vit_b_32")
-class ViTBase32Model(ClassificationModel):
-    """Vision Transformer (ViT-B/32) model for classification."""
-    
-    def __init__(
-        self,
-        weights: str = "IMAGENET1K_V1",
-        num_classes: int = 1000,
-    ):
-        weights_obj = models.ViT_B_32_Weights.IMAGENET1K_V1
-        backbone = models.vit_b_32(weights=weights_obj)
-        
-        transforms = weights_obj.transforms()
-        preprocess_config = {
-            "input_size": 224,
-            "mean": list(transforms.mean),
-            "std": list(transforms.std),
-        }
-        
-        super().__init__(
-            name="vit_b_32",
-            backbone=backbone,
-            num_classes=num_classes,
-            preprocessing_config=preprocess_config,
-        )
-
-
-@register_model("efficientnet_b0")
-class EfficientNetB0Model(ClassificationModel):
-    """EfficientNet-B0 model for classification."""
-    
-    def __init__(
-        self,
-        weights: str = "IMAGENET1K_V1",
-        num_classes: int = 1000,
-    ):
-        weights_obj = models.EfficientNet_B0_Weights.IMAGENET1K_V1
-        backbone = models.efficientnet_b0(weights=weights_obj)
-        
-        transforms = weights_obj.transforms()
-        preprocess_config = {
-            "input_size": 224,
-            "mean": list(transforms.mean),
-            "std": list(transforms.std),
-        }
-        
-        super().__init__(
-            name="efficientnet_b0",
-            backbone=backbone,
-            num_classes=num_classes,
-            preprocessing_config=preprocess_config,
-        )
-
-
-# TODO: Week 2-3 - Add detection models
-# @register_model("fasterrcnn_resnet50")
-# class FasterRCNNResNet50(BaseModel):
-#     """Faster R-CNN with ResNet-50 backbone for object detection."""
-#     pass
+for _short, _timm in [
+    ("resnet50",    "resnet50"),
+    ("deit_tiny",   "deit_tiny_patch16_224"),
+    ("deit_small",  "deit_small_patch16_224"),
+    ("deit_base",   "deit_base_patch16_224"),
+]:
+    register_model(_short)(_timm_builder(_short, _timm))
+    # Also register the full timm name as an alias
+    if _short != _timm:
+        register_model(_timm)(_timm_builder(_short, _timm))
