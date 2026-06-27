@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchao.quantization import (
     quantize_,
     Int8WeightOnlyConfig,
@@ -130,6 +131,86 @@ def count_layers(model: nn.Module) -> Dict[str, int]:
 
 
 # ============================================================================
+# 4-bit weight-only Conv2d (for CNNs whose weights torchao's Linear-only
+# int4 path leaves untouched, e.g. ResNet50 ~92% Conv2d weights)
+# ============================================================================
+
+class Int4Conv2d(nn.Module):
+    """Weight-only 4-bit (group-wise affine uint4) drop-in for nn.Conv2d.
+
+    Stores conv weights as packed int4 (two values per byte) plus per-group
+    fp16 scale/min, dequantizing on the fly in forward(). This yields a real
+    ~8x reduction of the (dominant) conv weight storage, so CNNs actually
+    compress under W4 — torchao's int4 path only covers nn.Linear.
+    """
+
+    def __init__(self, conv: nn.Conv2d, group_size: int = 128):
+        super().__init__()
+        self.stride = conv.stride
+        self.padding = conv.padding
+        self.dilation = conv.dilation
+        self.groups = conv.groups
+        self.out_channels = conv.out_channels
+        self.orig_shape = tuple(conv.weight.shape)  # [out, in/groups, kH, kW]
+
+        W = conv.weight.detach().reshape(self.out_channels, -1).float()  # [out, K]
+        K = W.shape[1]
+        gs = K if (group_size is None or group_size <= 0) else min(group_size, K)
+        n_groups = (K + gs - 1) // gs
+        Kp = n_groups * gs
+        self.K, self.gs, self.n_groups, self.Kp = K, gs, n_groups, Kp
+
+        if Kp > K:
+            W = F.pad(W, (0, Kp - K))
+        Wg = W.reshape(self.out_channels, n_groups, gs)
+        wmin = Wg.min(dim=2, keepdim=True).values
+        wmax = Wg.max(dim=2, keepdim=True).values
+        scale = (wmax - wmin).clamp_(min=1e-8) / 15.0
+        q = ((Wg - wmin) / scale).round_().clamp_(0, 15).to(torch.uint8)
+        q = q.reshape(self.out_channels, Kp)
+        if Kp % 2 == 1:  # ensure an even number of nibbles to pack
+            q = F.pad(q, (0, 1))
+        packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous()  # [out, ceil(Kp/2)]
+
+        self.register_buffer("weight_packed", packed)
+        self.register_buffer("scale", scale.squeeze(-1).half())  # [out, n_groups]
+        self.register_buffer("wmin", wmin.squeeze(-1).half())    # [out, n_groups]
+        if conv.bias is not None:
+            self.register_buffer("bias", conv.bias.detach().clone())
+        else:
+            self.bias = None
+
+    def _dequantize_weight(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        packed = self.weight_packed
+        low = (packed & 0x0F).float()
+        high = (packed >> 4).float()
+        q = torch.stack([low, high], dim=2).reshape(self.out_channels, -1)  # interleave
+        q = q[:, : self.Kp].reshape(self.out_channels, self.n_groups, self.gs)
+        scale = self.scale.float().unsqueeze(-1)
+        wmin = self.wmin.float().unsqueeze(-1)
+        W = (q * scale + wmin).reshape(self.out_channels, self.Kp)[:, : self.K]
+        return W.reshape(self.orig_shape).to(device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self._dequantize_weight(x.dtype, x.device)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.conv2d(x, w, b, self.stride, self.padding, self.dilation, self.groups)
+
+
+def _quantize_conv2d_int4(model: nn.Module, group_size: int = 128) -> int:
+    """Replace every nn.Conv2d in `model` with Int4Conv2d, in place. Returns count."""
+    n = 0
+    for name, child in list(model.named_children()):
+        if isinstance(child, nn.Conv2d):
+            device = child.weight.device
+            setattr(model, name, Int4Conv2d(child, group_size=group_size).to(device))
+            n += 1
+        else:
+            n += _quantize_conv2d_int4(child, group_size=group_size)
+    return n
+
+
+# ============================================================================
 # Main API
 # ============================================================================
 
@@ -157,6 +238,7 @@ def quantize_model(
     device: Optional[str] = None,
     group_size: int = 128,
     use_hqq: bool = True,
+    quantize_conv: bool = True,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """Quantize a model using torchao.
 
@@ -164,11 +246,14 @@ def quantize_model(
     quantize_() is applied in-place on the copy.
 
     Args:
-        model:      The nn.Module to quantize (e.g. model.backbone).
-        mode:       One of QUANT_MODES keys. Default "W4" (paper PTQ baseline).
-        device:     Device for quantization (default: keep current device).
-        group_size: Group size for W4 quantization (default 128).
-        use_hqq:    Use HQQ for W4 quantization (default True, per paper).
+        model:         The nn.Module to quantize (e.g. model.backbone).
+        mode:          One of QUANT_MODES keys. Default "W4" (paper PTQ baseline).
+        device:        Device for quantization (default: keep current device).
+        group_size:    Group size for W4 quantization (default 128).
+        use_hqq:       Use HQQ for W4 quantization (default True, per paper).
+        quantize_conv: For W4, also 4-bit quantize nn.Conv2d weights via
+                       Int4Conv2d (default True). torchao only covers nn.Linear,
+                       so this is what makes CNNs (ResNet50) actually compress.
 
     Returns:
         (quantized_model, stats_dict)
@@ -190,12 +275,16 @@ def quantize_model(
     ao_config = _get_torchao_config(mode, group_size=group_size, use_hqq=use_hqq)
 
     t0 = time.time()
-    quantize_(q_model, ao_config)
+    quantize_(q_model, ao_config)  # torchao: nn.Linear weights -> int4
+    n_conv = 0
+    if mode == "W4" and quantize_conv:
+        n_conv = _quantize_conv2d_int4(q_model, group_size=group_size)  # nn.Conv2d -> int4
     quant_time = time.time() - t0
 
     quantized_size = get_model_size_mb(q_model)
     quantized_layers = count_layers(q_model)
 
+    target = "nn.Linear (torchao)" + (f" + {n_conv} nn.Conv2d (int4)" if n_conv else "")
     stats = {
         "mode": mode,
         "mode_description": QUANT_MODES[mode],
@@ -206,7 +295,8 @@ def quantize_model(
         "quantization_time_s": quant_time,
         "original_layers": original_layers,
         "quantized_layers": quantized_layers,
-        "target_layers": "nn.Linear (torchao default)",
+        "conv_layers_int4": n_conv,
+        "target_layers": target,
     }
 
     logger.info(
