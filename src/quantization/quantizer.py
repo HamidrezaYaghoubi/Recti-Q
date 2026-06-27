@@ -135,13 +135,47 @@ def count_layers(model: nn.Module) -> Dict[str, int]:
 # int4 path leaves untouched, e.g. ResNet50 ~92% Conv2d weights)
 # ============================================================================
 
+def _hqq_int4_groups(Wg: torch.Tensor, nbits: int = 4, iters: int = 20,
+                     lp_norm: float = 0.7, beta0: float = 1e1, kappa: float = 1.01):
+    """HQQ (half-quadratic) group-wise affine int4: W ≈ scale * (q - zero).
+
+    Calibration-free, like the paper's Int4WeightOnly(use_hqq=True). Optimizes
+    the per-group zero-point with an Lp (p<1) proximal solver to minimize weight
+    error — crucial for CNNs, where plain round-to-nearest int4 desyncs frozen
+    BatchNorm stats and collapses accuracy.
+
+    Wg: [out, n_groups, gs]. Returns (q uint8, scale, zero) with q in [0, 2^b-1].
+    """
+    qmax = (1 << nbits) - 1
+    wmin = Wg.min(dim=2, keepdim=True).values
+    wmax = Wg.max(dim=2, keepdim=True).values
+    scale = ((wmax - wmin) / qmax).clamp_(min=1e-8)
+    zero = -wmin / scale  # so q = round(W/scale + zero) lands in [0, qmax]
+    best_err = None
+    beta = beta0
+    for _ in range(iters):
+        q = (Wg / scale + zero).round().clamp_(0, qmax)
+        err = Wg - scale * (q - zero)
+        shrunk = torch.sign(err) * F.relu(
+            err.abs() - (1.0 / beta) * err.abs().clamp_(min=1e-8).pow(lp_norm - 1)
+        )
+        zero = (q - (Wg - shrunk) / scale).mean(dim=2, keepdim=True)
+        beta *= kappa
+        cur = (Wg - scale * (q - zero)).abs().mean()
+        if best_err is not None and cur >= best_err:
+            break
+        best_err = cur
+    q = (Wg / scale + zero).round().clamp_(0, qmax).to(torch.uint8)
+    return q, scale, zero
+
+
 class Int4Conv2d(nn.Module):
-    """Weight-only 4-bit (group-wise affine uint4) drop-in for nn.Conv2d.
+    """Weight-only 4-bit (group-wise HQQ) drop-in for nn.Conv2d.
 
     Stores conv weights as packed int4 (two values per byte) plus per-group
-    fp16 scale/min, dequantizing on the fly in forward(). This yields a real
-    ~8x reduction of the (dominant) conv weight storage, so CNNs actually
-    compress under W4 — torchao's int4 path only covers nn.Linear.
+    fp16 scale/zero, dequantizing W = scale*(q - zero) on the fly in forward().
+    Yields a real ~8x reduction of the (dominant) conv weight storage, so CNNs
+    actually compress under W4 — torchao's int4 path only covers nn.Linear.
     """
 
     def __init__(self, conv: nn.Conv2d, group_size: int = 128):
@@ -163,10 +197,7 @@ class Int4Conv2d(nn.Module):
         if Kp > K:
             W = F.pad(W, (0, Kp - K))
         Wg = W.reshape(self.out_channels, n_groups, gs)
-        wmin = Wg.min(dim=2, keepdim=True).values
-        wmax = Wg.max(dim=2, keepdim=True).values
-        scale = (wmax - wmin).clamp_(min=1e-8) / 15.0
-        q = ((Wg - wmin) / scale).round_().clamp_(0, 15).to(torch.uint8)
+        q, scale, zero = _hqq_int4_groups(Wg, nbits=4)
         q = q.reshape(self.out_channels, Kp)
         if Kp % 2 == 1:  # ensure an even number of nibbles to pack
             q = F.pad(q, (0, 1))
@@ -174,7 +205,7 @@ class Int4Conv2d(nn.Module):
 
         self.register_buffer("weight_packed", packed)
         self.register_buffer("scale", scale.squeeze(-1).half())  # [out, n_groups]
-        self.register_buffer("wmin", wmin.squeeze(-1).half())    # [out, n_groups]
+        self.register_buffer("zero", zero.squeeze(-1).half())    # [out, n_groups]
         if conv.bias is not None:
             self.register_buffer("bias", conv.bias.detach().clone())
         else:
@@ -187,8 +218,8 @@ class Int4Conv2d(nn.Module):
         q = torch.stack([low, high], dim=2).reshape(self.out_channels, -1)  # interleave
         q = q[:, : self.Kp].reshape(self.out_channels, self.n_groups, self.gs)
         scale = self.scale.float().unsqueeze(-1)
-        wmin = self.wmin.float().unsqueeze(-1)
-        W = (q * scale + wmin).reshape(self.out_channels, self.Kp)[:, : self.K]
+        zero = self.zero.float().unsqueeze(-1)
+        W = (scale * (q - zero)).reshape(self.out_channels, self.Kp)[:, : self.K]
         return W.reshape(self.orig_shape).to(device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -238,7 +269,7 @@ def quantize_model(
     device: Optional[str] = None,
     group_size: int = 128,
     use_hqq: bool = True,
-    quantize_conv: bool = True,
+    quantize_conv: bool = False,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """Quantize a model using torchao.
 
@@ -251,9 +282,12 @@ def quantize_model(
         device:        Device for quantization (default: keep current device).
         group_size:    Group size for W4 quantization (default 128).
         use_hqq:       Use HQQ for W4 quantization (default True, per paper).
-        quantize_conv: For W4, also 4-bit quantize nn.Conv2d weights via
-                       Int4Conv2d (default True). torchao only covers nn.Linear,
-                       so this is what makes CNNs (ResNet50) actually compress.
+        quantize_conv: For W4, also 4-bit quantize nn.Conv2d via Int4Conv2d.
+                       Default False — the paper's ImageNet-C W4 is Linear-only
+                       (ResNet50 stays ~91 MB, Table III), so this matches the
+                       paper. EXPERIMENTAL: enabling it compresses CNNs heavily
+                       but currently degrades ResNet50 accuracy (frozen BatchNorm
+                       desyncs from the quantized conv weights). See Int4Conv2d.
 
     Returns:
         (quantized_model, stats_dict)
