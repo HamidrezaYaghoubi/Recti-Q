@@ -6,6 +6,8 @@ from src.quantization.quantizer import (
     resolve_mode,
     get_model_size_mb,
     count_layers,
+    recalibrate_batchnorm,
+    Int4Conv2d,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "resolve_mode",
     "get_model_size_mb",
     "count_layers",
+    "recalibrate_batchnorm",
+    "Int4Conv2d",
 ]

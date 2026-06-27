@@ -97,6 +97,12 @@ class QuantizationConfig:
     modes: List[str] = field(default_factory=lambda: ["W4"])
     group_size: int = 128
     use_hqq: bool = True
+    # Experimental: also 4-bit quantize nn.Conv2d (for CNNs like ResNet50, whose
+    # weights torchao leaves in FP). Off by default (paper's ImageNet-C ResNet50
+    # W4 is Linear-only). When on, bn_recalib_batches > 0 re-fits BatchNorm stats
+    # on source data so the quantized CNN does not collapse.
+    quantize_conv: bool = False
+    bn_recalib_batches: int = 0
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QuantizationConfig":
@@ -108,6 +114,8 @@ class QuantizationConfig:
             modes=modes,
             group_size=int(data.get("group_size", 128)),
             use_hqq=bool(data.get("use_hqq", True)),
+            quantize_conv=bool(data.get("quantize_conv", False)),
+            bn_recalib_batches=int(data.get("bn_recalib_batches", 0)),
         )
 
 

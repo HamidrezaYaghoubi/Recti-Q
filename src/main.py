@@ -53,7 +53,7 @@ from src.datasets import (
     get_pacs_loaders,
     PACS_DOMAINS,
 )
-from src.quantization import quantize_model, get_model_size_mb
+from src.quantization import quantize_model, get_model_size_mb, recalibrate_batchnorm
 from src.rectiq import train_rectiq_adapter, RectiQTrainConfig, save_adapter
 
 
@@ -208,8 +208,16 @@ def run_phases(model, exp: ExperimentConfig, train_loader, val_loader,
     q_backbone, q_stats = quantize_model(
         model.backbone, mode="W4", device=device,
         group_size=exp.quantization.group_size, use_hqq=exp.quantization.use_hqq,
+        quantize_conv=exp.quantization.quantize_conv,
     )
     print(format_quantization_stats(model.name, "W4", q_stats))
+    # Re-fit BatchNorm to the quantized conv weights (source-only) so CNNs don't collapse.
+    if exp.quantization.quantize_conv and exp.quantization.bn_recalib_batches > 0:
+        n_bn = recalibrate_batchnorm(q_backbone, train_loader, device,
+                                     num_batches=exp.quantization.bn_recalib_batches)
+        if n_bn:
+            text_logger.info(f"  BN recalibration: {n_bn} layers over "
+                             f"{exp.quantization.bn_recalib_batches} source batches")
     w4_size = q_stats["quantized_size_mb"]
     w4_id = evaluate(q_backbone, val_loader, device, max_batches=eval_mb, desc="w4 id")["top1_accuracy"]
     w4_ood = ood_eval(q_backbone)

@@ -150,8 +150,14 @@ def _hqq_int4_groups(Wg: torch.Tensor, nbits: int = 4, iters: int = 20,
     wmin = Wg.min(dim=2, keepdim=True).values
     wmax = Wg.max(dim=2, keepdim=True).values
     scale = ((wmax - wmin) / qmax).clamp_(min=1e-8)
-    zero = -wmin / scale  # so q = round(W/scale + zero) lands in [0, qmax]
-    best_err = None
+    zero = -wmin / scale  # init = round-to-nearest; q = round(W/scale + zero) in [0, qmax]
+
+    def _err(z):
+        q = (Wg / scale + z).round().clamp_(0, qmax)
+        return (Wg - scale * (q - z)).abs().mean().item()
+
+    best_zero = zero.clone()
+    best_err = _err(zero)  # RTN baseline — HQQ can only improve on this
     beta = beta0
     for _ in range(iters):
         q = (Wg / scale + zero).round().clamp_(0, qmax)
@@ -161,10 +167,12 @@ def _hqq_int4_groups(Wg: torch.Tensor, nbits: int = 4, iters: int = 20,
         )
         zero = (q - (Wg - shrunk) / scale).mean(dim=2, keepdim=True)
         beta *= kappa
-        cur = (Wg - scale * (q - zero)).abs().mean()
-        if best_err is not None and cur >= best_err:
+        cur = _err(zero)
+        if cur < best_err:
+            best_err, best_zero = cur, zero.clone()
+        else:
             break
-        best_err = cur
+    zero = best_zero
     q = (Wg / scale + zero).round().clamp_(0, qmax).to(torch.uint8)
     return q, scale, zero
 
@@ -239,6 +247,32 @@ def _quantize_conv2d_int4(model: nn.Module, group_size: int = 128) -> int:
         else:
             n += _quantize_conv2d_int4(child, group_size=group_size)
     return n
+
+
+@torch.no_grad()
+def recalibrate_batchnorm(model: nn.Module, loader, device: str, num_batches: int = 200) -> int:
+    """Re-estimate BatchNorm running stats to match the quantized weights.
+
+    Frozen BN running mean/var (fitted for FP weights) desync once weights are
+    quantized, which can collapse CNN accuracy. Reset them and recompute via a
+    cumulative average over a few source batches. Returns #BN layers updated.
+    """
+    bns = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not bns:
+        return 0
+    saved = [(bn.momentum, bn.training) for bn in bns]
+    for bn in bns:
+        bn.reset_running_stats()
+        bn.momentum = None  # cumulative moving average over the calibration batches
+        bn.train()
+    for i, batch in enumerate(loader):
+        if i >= num_batches:
+            break
+        model(batch[0].to(device))
+    for bn, (mom, was_training) in zip(bns, saved):
+        bn.momentum = mom
+        bn.train(was_training)
+    return len(bns)
 
 
 # ============================================================================

@@ -1,0 +1,76 @@
+# ResNet50 on ImageNet-C with 4-bit conv quantization (experimental).
+#
+# Unlike the default imagenet_c_rectiq.yaml (W4 = torchao Linear-only, which
+# barely compresses ResNet50), this enables Int4Conv2d so the CNN actually
+# compresses, plus BatchNorm recalibration on source data so accuracy is
+# preserved. Used to push ResNet50 as close to the paper's claims as possible.
+
+experiment:
+  name: "imagenet_c_rectiq_resnet"
+  description: "ResNet50 ImageNet-C: W4 with int4 conv-quant + BN recalibration"
+  seed: 42
+  device: "cuda"
+  num_workers: 8
+  debug: false
+  debug_samples: 200
+
+models:
+  - name: "resnet50"
+    architecture: "resnet50"
+    weights: "pretrained"
+    num_classes: 1000
+
+datasets:
+  imagenet:
+    name: "imagenet"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet/validation"
+    split: "val"
+    train_root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet/train/train"
+    subset_fraction: 0.05
+    subset_balanced: true
+    subset_seed: 42
+    batch_size: 128
+    num_workers: 8
+    pin_memory: true
+  imagenet_c:
+    name: "imagenet_c"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet_c"
+    corruptions: ["contrast", "gaussian_noise", "shot_noise", "impulse_noise"]
+    severities: [5]
+    batch_size: 256
+    num_workers: 8
+    pin_memory: true
+
+quantization:
+  enabled: true
+  modes: ["W4"]
+  group_size: 128
+  use_hqq: true
+  quantize_conv: true        # 4-bit int4 on nn.Conv2d (HQQ) -> real CNN compression
+  bn_recalib_batches: 200    # re-fit BatchNorm on source data after quantization
+
+rectiq:
+  enabled: true
+  rank: 64
+  alpha: 16.0
+  kd_lambda: 1.0
+  temperature: 4.0
+  epochs: 5
+  lr: 0.0003
+  weight_decay: 0.0001
+  adapter_space: "feature"
+  num_workers: 8
+  output_dir: "./results/rectiq_adapters"
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_dir: "./logs"
+  wandb:
+    enabled: false
+    project: "recti-q"
+    tags: ["recti-q", "imagenet-c", "resnet50", "w4", "conv-int4", "bn-recalib"]
+
+output:
+  results_dir: "./results"
+  checkpoint_dir: "./checkpoints"

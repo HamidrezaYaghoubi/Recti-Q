@@ -1,0 +1,2 @@
+ERROR: Unable to locate a modulefile for 'gcc/11.2.0'
+/fs/nexus-scratch/yaghoubi/anaconda3/envs/saficiency/etc/conda/activate.d/libblas_mkl_activate.sh: line 1: MKL_INTERFACE_LAYER: unbound variable
