@@ -33,9 +33,10 @@ datasets:
   # ImageNet-1k: validation = ID; train (via train_root) = source for the 5% subset.
   imagenet:
     name: "imagenet"
-    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet"
-    split: "validation"
-    train_root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet/train"
+    # Actual ImageFolders are nested: validation/val/<wnid> and train/train/<wnid>.
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet/validation"
+    split: "val"
+    train_root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/imagenet/train/train"
     subset_fraction: 0.05
     subset_balanced: true
     subset_seed: 42
