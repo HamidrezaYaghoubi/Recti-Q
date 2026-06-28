@@ -1,0 +1,62 @@
+# ResNet50 PACS (target=art_painting), int4-conv W4 (true 4-bit on convs).
+# For correcting Table II: W4 with Int4Conv2d + BN recalibration -> ResNet50 ~12.5 MB.
+
+experiment:
+  name: "pacs_rectiq_resnet_conv4"
+  description: "ResNet50 PACS art_painting, int4-conv W4 (~12.5 MB) + BN recalib"
+  seed: 42
+  device: "cuda"
+  num_workers: 8
+  debug: false
+  debug_samples: 200
+
+models:
+  - name: "resnet50"
+    architecture: "resnet50"
+    weights: "pretrained"
+    num_classes: 7
+
+datasets:
+  pacs:
+    name: "pacs"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/pacs"
+    target_domain: "art_painting"
+    base_train_epochs: 30
+    base_lr: 0.0001
+    batch_size: 64
+    num_workers: 8
+    pin_memory: true
+
+quantization:
+  enabled: true
+  modes: ["W4"]
+  group_size: 128
+  use_hqq: true
+  quantize_conv: true    # true 4-bit on nn.Conv2d
+  conv_bits: 4
+  bn_recalib_batches: 200
+
+rectiq:
+  enabled: true
+  rank: 64
+  alpha: 16.0
+  kd_lambda: 1.0
+  temperature: 4.0
+  epochs: 10
+  lr: 0.0003
+  weight_decay: 0.0001
+  adapter_space: "feature"
+  num_workers: 8
+  output_dir: "./results/rectiq_adapters"
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_dir: "./logs"
+  wandb:
+    enabled: false
+    project: "recti-q"
+
+output:
+  results_dir: "./results"
+  checkpoint_dir: "./checkpoints"
