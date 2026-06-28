@@ -46,8 +46,9 @@ quantization:
   modes: ["W4"]
   group_size: 128
   use_hqq: true
-  quantize_conv: true        # 4-bit int4 on nn.Conv2d (HQQ) -> real CNN compression
-  bn_recalib_batches: 200    # re-fit BatchNorm on source data after quantization
+  quantize_conv: true        # quantize nn.Conv2d (torchao only covers Linear)
+  conv_bits: 8               # int8 conv: ~2-3x (closer to paper's 2x), near-lossless
+  bn_recalib_batches: 100    # gentle BN re-fit on source data after quantization
 
 rectiq:
   enabled: true

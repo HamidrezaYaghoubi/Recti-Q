@@ -102,6 +102,7 @@ class QuantizationConfig:
     # W4 is Linear-only). When on, bn_recalib_batches > 0 re-fits BatchNorm stats
     # on source data so the quantized CNN does not collapse.
     quantize_conv: bool = False
+    conv_bits: int = 4          # 4 (~8x, aggressive) or 8 (~4x, near-lossless)
     bn_recalib_batches: int = 0
 
     @classmethod
@@ -115,6 +116,7 @@ class QuantizationConfig:
             group_size=int(data.get("group_size", 128)),
             use_hqq=bool(data.get("use_hqq", True)),
             quantize_conv=bool(data.get("quantize_conv", False)),
+            conv_bits=int(data.get("conv_bits", 4)),
             bn_recalib_batches=int(data.get("bn_recalib_batches", 0)),
         )
 

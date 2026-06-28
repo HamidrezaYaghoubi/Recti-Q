@@ -208,7 +208,7 @@ def run_phases(model, exp: ExperimentConfig, train_loader, val_loader,
     q_backbone, q_stats = quantize_model(
         model.backbone, mode="W4", device=device,
         group_size=exp.quantization.group_size, use_hqq=exp.quantization.use_hqq,
-        quantize_conv=exp.quantization.quantize_conv,
+        quantize_conv=exp.quantization.quantize_conv, conv_bits=exp.quantization.conv_bits,
     )
     print(format_quantization_stats(model.name, "W4", q_stats))
     # Re-fit BatchNorm to the quantized conv weights (source-only) so CNNs don't collapse.
