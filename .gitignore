@@ -234,3 +234,7 @@ logs/
 !logs/.gitkeep
 run_log.txt
 *.log
+
+# Keep the released Recti-Q adapters (tiny) even though *.pt is ignored elsewhere
+!adapters/
+!adapters/*.pt
