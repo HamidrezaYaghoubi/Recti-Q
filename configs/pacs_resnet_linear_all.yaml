@@ -1,0 +1,59 @@
+# ResNet50 PACS worst-case search: Linear-only W4, all 4 leave-one-domain-out targets.
+# Finds the target domain with the largest W4-vs-FP32 drop and Recti-Q recovery there.
+
+experiment:
+  name: "pacs_resnet_linear_all"
+  description: "ResNet50 PACS LODO (all 4 domains), Linear-only W4"
+  seed: 42
+  device: "cuda"
+  num_workers: 8
+  debug: false
+  debug_samples: 200
+
+models:
+  - name: "resnet50"
+    architecture: "resnet50"
+    weights: "pretrained"
+    num_classes: 7
+
+datasets:
+  pacs:
+    name: "pacs"
+    root: "/fs/nexus-projects/pc_driving/yaghoubi/datasets/pacs"
+    target_domain: null        # null => leave-one-out over all four domains
+    base_train_epochs: 30
+    base_lr: 0.0001
+    batch_size: 64
+    num_workers: 8
+    pin_memory: true
+
+quantization:
+  enabled: true
+  modes: ["W4"]
+  group_size: 128
+  use_hqq: true
+  quantize_conv: false
+
+rectiq:
+  enabled: true
+  rank: 64
+  alpha: 16.0
+  kd_lambda: 1.0
+  temperature: 4.0
+  epochs: 10
+  lr: 0.0003
+  weight_decay: 0.0001
+  adapter_space: "feature"
+  num_workers: 8
+  output_dir: "./results/rectiq_adapters"
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_dir: "./logs"
+  wandb:
+    enabled: false
+
+output:
+  results_dir: "./results"
+  checkpoint_dir: "./checkpoints"

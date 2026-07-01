@@ -186,8 +186,10 @@ def run_phases(model, exp: ExperimentConfig, train_loader, val_loader,
     """
     Run FP32 -> W4 -> Recti-Q on one (model, source/target) setup.
 
-    ood_eval(module) -> float : returns OOD top-1 for a logits-producing module.
-    Returns {precision: {"id": top1, "ood": top1, "size_mb": mb}}.
+    ood_eval(module) -> Dict[str, float] : per-key OOD top-1 (per-corruption for
+    ImageNet-C, single-entry for PACS). The mean is used for the summary rows;
+    the per-key dicts feed the worst-drop / recovery breakdown.
+    Returns {precision: {"id": top1, "ood": mean_top1, "size_mb": mb}}.
     """
     device = exp.device
     eval_mb = 2 if exp.debug else None
@@ -195,10 +197,12 @@ def run_phases(model, exp: ExperimentConfig, train_loader, val_loader,
     wb = make_wandb(exp, run_name, tags=[dataset_tag, model.name])
     results: Dict[str, Any] = {}
     rows = []
+    _mean = lambda m: sum(m.values()) / max(len(m), 1)
 
     # ── Phase 1: FP32 ──
     fp32_id = evaluate(model.backbone, val_loader, device, max_batches=eval_mb, desc="fp32 id")["top1_accuracy"]
-    fp32_ood = ood_eval(model.backbone)
+    fp32_ood_map = ood_eval(model.backbone)
+    fp32_ood = _mean(fp32_ood_map)
     fp32_size = get_model_size_mb(model.backbone)
     results["FP32"] = {"id": fp32_id, "ood": fp32_ood, "size_mb": fp32_size}
     rows.append({"precision": "FP32", "metrics": {"top1_accuracy": fp32_ood}, "size_mb": fp32_size})
@@ -220,7 +224,8 @@ def run_phases(model, exp: ExperimentConfig, train_loader, val_loader,
                              f"{exp.quantization.bn_recalib_batches} source batches")
     w4_size = q_stats["quantized_size_mb"]
     w4_id = evaluate(q_backbone, val_loader, device, max_batches=eval_mb, desc="w4 id")["top1_accuracy"]
-    w4_ood = ood_eval(q_backbone)
+    w4_ood_map = ood_eval(q_backbone)
+    w4_ood = _mean(w4_ood_map)
     results["W4"] = {"id": w4_id, "ood": w4_ood, "size_mb": w4_size}
     rows.append({"precision": "W4", "metrics": {"top1_accuracy": w4_ood}, "size_mb": w4_size})
     text_logger.info(f"  W4    | ID {w4_id:.2f}% | OOD {w4_ood:.2f}% | {w4_size:.1f} MB")
@@ -239,7 +244,8 @@ def run_phases(model, exp: ExperimentConfig, train_loader, val_loader,
             config=cfg, teacher_model=teacher,
         )
         rq_id = evaluate(rq.model, val_loader, device, max_batches=eval_mb, desc="rectiq id")["top1_accuracy"]
-        rq_ood = ood_eval(rq.model)
+        rq_ood_map = ood_eval(rq.model)
+        rq_ood = _mean(rq_ood_map)
         # Effective size = frozen W4 backbone + tiny adapter.
         adapter_dir = Path(exp.rectiq.output_dir or (Path(exp.output.results_dir) / exp.name / "rectiq_adapters"))
         adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +265,25 @@ def run_phases(model, exp: ExperimentConfig, train_loader, val_loader,
         )
 
     print(format_phase_comparison(model.name, ood_tag, rows))
+
+    # Per-key (corruption/domain) breakdown: worst W4 drop and Recti-Q recovery there.
+    if len(fp32_ood_map) > 1:
+        rq_map = rq_ood_map if exp.rectiq.enabled else {}
+        breakdown = []
+        for k in fp32_ood_map:
+            fp, w4v = fp32_ood_map[k], w4_ood_map[k]
+            rqv = rq_map.get(k)
+            breakdown.append((k, fp, w4v, rqv, w4v - fp, (rqv - w4v) if rqv is not None else None))
+        breakdown.sort(key=lambda r: r[4])  # most-negative W4 gap first
+        text_logger.info(f"  Per-key OOD (worst W4 drop first) — {model.name}:")
+        for k, fp, w4v, rqv, gap, recov in breakdown:
+            rq_s = f"{rqv:6.2f}" if rqv is not None else "   -  "
+            rc_s = f"{recov:+.2f}" if recov is not None else "  - "
+            text_logger.info(f"    {k:20} FP32 {fp:6.2f} | W4 {w4v:6.2f} (gap {gap:+.2f}) | "
+                             f"RectiQ {rq_s} (recov {rc_s})")
+        w = breakdown[0]
+        text_logger.info(f"  >>> WORST W4 drop: {w[0]} gap {w[4]:+.2f} pp; "
+                         f"Recti-Q recovery there {('%+.2f' % w[5]) if w[5] is not None else 'n/a'} pp")
 
     if wb is not None:
         summary = {}
@@ -301,7 +326,7 @@ def run_imagenet_c(model_cfg: ModelConfig, exp: ExperimentConfig, text_logger) -
 
     def ood_eval(module):
         return evaluate_imagenet_c(module, ood_loaders, exp.device,
-                                   max_batches=eval_mb, max_combos=max_combos)["mean_top1"]
+                                   max_batches=eval_mb, max_combos=max_combos)["per_combo"]
 
     return run_phases(
         model, exp, train_loader, val_loader, ood_eval,
@@ -335,7 +360,8 @@ def run_pacs(model_cfg: ModelConfig, exp: ExperimentConfig, text_logger) -> Dict
             text_logger.info(f"  PACS base ERM ({base_epochs} ep) source-val top-1: {best:.2f}%")
 
         def ood_eval(module):
-            return evaluate(module, test_loader, exp.device, max_batches=eval_mb, desc="ood")["top1_accuracy"]
+            return {target: evaluate(module, test_loader, exp.device,
+                                     max_batches=eval_mb, desc="ood")["top1_accuracy"]}
 
         out[target] = run_phases(
             model, exp, train_loader, val_loader, ood_eval,
