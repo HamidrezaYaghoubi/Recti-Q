@@ -64,7 +64,7 @@ single A5000, seed 42):
 | Model | ID FP32→W4 | OOD FP32 | OOD W4 | OOD Recti-Q | Recovery | Size FP32→W4 |
 |-------|:----------:|:--------:|:------:|:-----------:|:--------:|:------------:|
 | DeiT-tiny  | 72.16 → 71.54 | 18.00 | 17.33 | **17.59** | +0.26 | 21.9 → 16.3 MB |
-| DeiT-small | 79.85 → 78.64 | 33.92 | 29.12 | **29.70** | +0.58 | 84.2 → 25.2 MB |
+| DeiT-small | 79.85 → 78.94 | 33.92 | 29.39 | **29.52** | +0.13 | 84.2 → 26.2 MB |
 | DeiT-base  | 81.98 → 81.50 | 45.38 | 44.10 | **45.09** | +0.99 | 330.3 → 56.5 MB |
 
 PTQ-W4 preserves ID (≤0.6 pp drop) but opens an OOD gap that grows with corruption severity;
