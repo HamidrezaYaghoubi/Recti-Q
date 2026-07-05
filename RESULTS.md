@@ -5,13 +5,10 @@ All numbers are top-1 accuracy (%). Single NVIDIA RTX A5000, `saficiency` env
 KD λ=1.0 (T=4), AdamW lr 3e-4, cosine, 5 epochs (ImageNet-C) / 10 (PACS), trained
 source-only on a 5% class-balanced ImageNet-1k train subset. ImageNet-C is severity 5.
 
-**W4 methods for ResNet50** (a CNN, ~92% Conv2d weights):
-- **Linear-only** — `torchao Int4WeightOnly(use_hqq=True)` (the paper's stated method); quantizes
-  only `nn.Linear`, so ResNet50 barely compresses (~91 MB) and barely degrades.
-- **int4-conv** — additionally 4-bit-quantizes `nn.Conv2d` (`IntConv2d`, HQQ) + BatchNorm
-  recalibration; real compression (~13.5 MB) but a genuine OOD gap the head adapter can't recover.
-
-DeiT models are Linear-heavy, so `torchao` Linear-only already compresses them well.
+**W4** = `torchao Int4WeightOnly(use_hqq=True)`, HQQ (calibration-free), applied to the
+backbone's `nn.Linear` layers. DeiT models are Linear-heavy, so W4 compresses them well.
+ResNet50 is a CNN (~92% of its weights live in `nn.Conv2d`), so the same Linear-only W4
+compresses it less and degrades it less.
 
 ---
 
@@ -45,20 +42,17 @@ FP32 and W4 match the paper within ≤0.2 pp; Recti-Q recovery is directionally 
 
 ### 2a. Summary (mean over contrast/gaussian/shot/impulse; + spatter)
 
-| Method | Corruptions | FP32 | W4 | Recti-Q | W4 gap | Recovery | Size FP32→W4 |
-|--------|:-----------:|:----:|:--:|:-------:|:------:|:--------:|:------------:|
-| Linear-only | 4-corruption mean | 21.80 | 21.67 | 27.16 | −0.13 | +1.49 | 97.8 → 91.0 MB |
-| Linear-only | spatter | 32.45 | 32.21 | 29.62 | −0.24 | **−2.59** | 97.8 → 91.0 MB |
-| int4-conv | 4-corruption mean | 21.80 | 18.32 | 18.02 | −3.48 | −0.30 | 97.8 → 13.5 MB |
-| int4-conv | spatter | 32.45 | 27.47 | 27.20 | −4.98 | −0.27 | 97.8 → 13.5 MB |
+| Corruptions | FP32 | W4 | Recti-Q | W4 gap | Recovery | Size FP32→W4 |
+|:-----------:|:----:|:--:|:-------:|:------:|:--------:|:------------:|
+| 4-corruption mean | 21.80 | 21.67 | 27.16 | −0.13 | +1.49 | 97.8 → 91.0 MB |
+| spatter | 32.45 | 32.21 | 29.62 | −0.24 | **−2.59** | 97.8 → 91.0 MB |
 
-> Under **Linear-only** the W4 gap is negligible (≤0.24), so there is essentially no
-> quantization-robustness gap to recover on ResNet50; Recti-Q's effect is a general head
-> reshaping that is **corruption-dependent** (see §2b). Under **int4-conv** a real gap appears but
-> the head-only adapter cannot recover it. Our FP32/W4 **spatter** matches the paper (32.39/32.19)
-> but our Recti-Q **hurts** spatter (−2.59) vs the paper's +0.11.
+> On ResNet50 the W4 gap is negligible (≤0.24), so there is essentially no
+> quantization-robustness gap to recover; Recti-Q's effect is a general head reshaping that is
+> **corruption-dependent** (see §2b). Our FP32/W4 **spatter** matches the paper (32.39/32.19) but
+> our Recti-Q **hurts** spatter (−2.59) vs the paper's +0.11.
 
-### 2b. ResNet50 Linear-only per-corruption — per seed and combined (mean ± std over seeds {0,1,2,42})
+### 2b. ResNet50 per-corruption — per seed and combined (mean ± std over seeds {0,1,2,42})
 
 `FP32`/`W4` are deterministic (adapter-independent). `RQ_s*` = Recti-Q OOD for that seed.
 
@@ -95,28 +89,28 @@ FP32 and W4 match the paper within ≤0.2 pp; Recti-Q recovery is directionally 
 Base model: 30-epoch ERM source fine-tune (source-val ≈ 96–98%). *Accuracy is from this
 reconstruction, not the paper's original PACS checkpoints.*
 
-| Target domain | Method | FP32 | W4 | Recti-Q | W4 gap | Recovery | Size W4 |
-|---------------|:------:|:----:|:--:|:-------:|:------:|:--------:|:-------:|
-| photo         | Linear-only | 98.32 | 98.26 | 98.14 | −0.06 | −0.12 | 90.0 MB |
-| art_painting  | Linear-only | 82.18 | 82.23 | 82.62 | +0.05 | +0.39 | 90.0 MB |
-| cartoon       | Linear-only | 74.53 | 74.53 | 75.34 |  0.00 | +0.81 | 90.0 MB |
-| sketch        | Linear-only | 69.99 | 70.04 | 71.39 | +0.05 | **+1.35** | 90.0 MB |
-| art_painting  | int4-conv   | 83.20 | 82.71 | 81.88 | −0.49 | −0.83 | 12.4 MB |
+| Target domain | FP32 | W4 | Recti-Q | W4 gap | Recovery | Size W4 |
+|---------------|:----:|:--:|:-------:|:------:|:--------:|:-------:|
+| photo         | 98.32 | 98.26 | 98.14 | −0.06 | −0.12 | 90.0 MB |
+| art_painting  | 82.18 | 82.23 | 82.62 | +0.05 | +0.39 | 90.0 MB |
+| cartoon       | 74.53 | 74.53 | 75.34 |  0.00 | +0.81 | 90.0 MB |
+| sketch        | 69.99 | 70.04 | 71.39 | +0.05 | **+1.35** | 90.0 MB |
 
-> Linear-only W4 gap is negligible on PACS too; Recti-Q recovery is positive on the harder domains
+> The W4 gap is negligible on PACS too; Recti-Q recovery is positive on the harder domains
 > (sketch +1.35, cartoon +0.81) and ~0 on the easy photo domain.
 
 ---
 
-## 4. Model sizes (MB) — corrected
+## 4. Model sizes (MB)
 
-| Model | Head | FP32 | Linear-only W4 | int4-conv W4 | Recti-Q adds |
-|-------|:----:|:----:|:--------------:|:------------:|:------------:|
-| ResNet50 | 1000-cls (ImageNet) | 97.79 | **91.0** | 13.5 | +0.76 |
-| ResNet50 | 7-cls (PACS) | 90.03 | **90.0** | 12.4 | +0.52 |
-| DeiT-tiny  | 1000 | 21.9 | 16.3 | — | +0.30 |
-| DeiT-small | 1000 | 84.2 | 26.2 | — | +0.35 |
-| DeiT-base  | 1000 | 330.3 | 56.5 | — | +0.44 |
+| Model | Head | FP32 | W4 | Recti-Q adds |
+|-------|:----:|:----:|:--:|:------------:|
+| ResNet50 | 1000-cls (ImageNet) | 97.79 | 91.0 | +0.76 |
+| ResNet50 | 7-cls (PACS) | 90.03 | 90.0 | +0.52 |
+| DeiT-tiny  | 1000 | 21.9 | 16.3 | +0.30 |
+| DeiT-small | 1000 | 84.2 | 26.2 | +0.35 |
+| DeiT-base  | 1000 | 330.3 | 56.5 | +0.44 |
 
-> The paper's **Table II ResNet50 W4 = 40.42 MB is a bug**: under the stated Linear-only method it
-> is ≈90 MB; the true 4-bit-conv size is ≈12.4 MB. Table III's 91.02 MB (ImageNet) is correct.
+> The paper's **Table II ResNet50 W4 = 40.42 MB is a bug**: under the stated W4 method (Linear-only
+> Int4WeightOnly) ResNet50 measures ≈90 MB, because most of its weights are in Conv2d layers that
+> this method leaves in FP. Table III's 91.02 MB (ImageNet) is the correct figure.
