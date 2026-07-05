@@ -42,12 +42,14 @@ from src.utils.logging import get_logger
 logger = get_logger("qda.datasets.imagenet_c")
 
 
-# All corruption types in ImageNet-C
+# All corruption types in ImageNet-C (15 standard + 4 "extra" corruptions,
+# e.g. spatter, which the paper's ResNet50 Table III row uses).
 CORRUPTION_TYPES = {
     "noise": ["gaussian_noise", "shot_noise", "impulse_noise"],
     "blur": ["defocus_blur", "glass_blur", "motion_blur", "zoom_blur"],
     "weather": ["snow", "frost", "fog", "brightness"],
     "digital": ["contrast", "elastic_transform", "pixelate", "jpeg_compression"],
+    "extra": ["speckle_noise", "gaussian_blur", "spatter", "saturate"],
 }
 
 ALL_CORRUPTIONS = [c for group in CORRUPTION_TYPES.values() for c in group]
