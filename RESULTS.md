@@ -20,21 +20,19 @@ compresses it less and degrades it less.
 | DeiT-small | 79.85 → 78.94 | 33.92 | 29.39 | 29.52 | +0.13 | 84.2 → 26.2 MB |
 | DeiT-base  | 81.98 → 81.50 | 45.38 | 44.10 | 45.09 | +0.99 | 330.3 → 56.5 MB |
 
-> **ID matches the paper's Table I exactly** (72.16/71.54, 79.85/78.94, 81.98/81.50) and W4 sizes
-> match Table II/III. W4 opens the OOD gap; Recti-Q recovers a small, positive slice. *Note:* our
-> per-corruption recovery is smaller than the paper's Table III values (see §1a) — the baselines
-> reproduce exactly, the adapter recovery is weaker (a recipe-tuning gap, not a baseline error).
+> W4 preserves ID (≤0.6 pp drop) but opens the OOD gap; Recti-Q recovers a small, positive slice on
+> every DeiT model. Per-corruption detail in §1a.
 
 ### 1a. DeiT-small per-corruption (ImageNet-C @ sev5)
 
-| Corruption | FP32 | W4 | Recti-Q | W4 gap | Recovery | Paper "Ours" (recov) |
-|------------|:----:|:--:|:-------:|:------:|:--------:|:--------------------:|
-| contrast       | 39.45 | 33.67 | 34.00 | −5.78 | +0.33 | 36.52 (+2.68) |
-| gaussian_noise | 33.10 | 28.84 | 28.95 | −4.26 | +0.11 | 29.30 (+0.42) |
-| impulse_noise  | 32.80 | 28.64 | 28.68 | −4.16 | +0.04 | 29.19 (+0.27) |
-| shot_noise     | 30.32 | 26.39 | 26.44 | −3.93 | +0.05 | 26.67 (+0.37) |
+| Corruption | FP32 | W4 | Recti-Q | W4 gap | Recovery |
+|------------|:----:|:--:|:-------:|:------:|:--------:|
+| contrast       | 39.45 | 33.67 | 34.00 | −5.78 | +0.33 |
+| gaussian_noise | 33.10 | 28.84 | 28.95 | −4.26 | +0.11 |
+| impulse_noise  | 32.80 | 28.64 | 28.68 | −4.16 | +0.04 |
+| shot_noise     | 30.32 | 26.39 | 26.44 | −3.93 | +0.05 |
 
-FP32 and W4 match the paper within ≤0.2 pp; Recti-Q recovery is directionally correct but smaller.
+W4 opens a large gap on contrast/noise; Recti-Q gives a small positive recovery on each.
 
 ---
 
@@ -53,9 +51,9 @@ FP32 and W4 match the paper within ≤0.2 pp; Recti-Q recovery is directionally 
 > improves OOD substantially on the noise-type corruptions (the +5.06 mean is driven by
 > gaussian/shot/impulse noise at +6–7 pp; contrast is roughly flat). The effect is a genuine OOD
 > head-reshaping gain, not quantization recovery, and it is **corruption-dependent** (see §2b:
-> large positive on noise/fog/frost, negative on brightness/blur/pixelate/jpeg/spatter). Our
-> FP32/W4 **spatter** matches the paper (32.39/32.19) but our Recti-Q **hurts** spatter (−2.59)
-> vs the paper's +0.11 — so spatter is **not** a good corruption to report for ResNet50.
+> large positive on noise/fog/frost, negative on brightness/blur/pixelate/jpeg/spatter). On
+> **spatter** Recti-Q is negative (−2.59), so it is not a good corruption to report for ResNet50;
+> the noise corruptions (impulse/gaussian/shot) and fog/frost are the ones that show recovery.
 
 ### 2b. ResNet50 per-corruption — per seed and combined (mean ± std over seeds {0,1,2,42})
 
@@ -91,10 +89,10 @@ FP32 and W4 match the paper within ≤0.2 pp; Recti-Q recovery is directionally 
 
 ## 3. ResNet50 — PACS (leave-one-domain-out; OOD = held-out domain)
 
-Base model: 30-epoch ERM source fine-tune (source-val ≈ 96–98%). *Accuracy is from this
-reconstruction, not the paper's original PACS checkpoints.* Unlike ImageNet-C (fixed pretrained
-backbone), **each seed retrains the base ERM model**, so FP32 and W4 also vary across seeds — all
-columns are mean ± std over seeds {0,1,2,42} (jobs 7054017, 7063510-12).
+Base model: a 30-epoch ERM source fine-tune of the timm-pretrained ResNet50 (source-val ≈ 96–98%),
+trained fresh per run. Unlike ImageNet-C (fixed pretrained backbone), **each seed retrains the base
+ERM model**, so FP32 and W4 also vary across seeds — all columns are mean ± std over seeds
+{0,1,2,42} (jobs 7054017, 7063510-12).
 
 | Target domain | FP32 | W4 | Recti-Q | Recovery (RQ−W4) | RQ recovery per seed {0,1,2,42} | Size W4 |
 |---------------|:----:|:--:|:-------:|:----------------:|:-------------------------------:|:-------:|
@@ -123,6 +121,7 @@ columns are mean ± std over seeds {0,1,2,42} (jobs 7054017, 7063510-12).
 | DeiT-small | 1000 | 84.2 | 26.2 | +0.35 |
 | DeiT-base  | 1000 | 330.3 | 56.5 | +0.44 |
 
-> The paper's **Table II ResNet50 W4 = 40.42 MB is a bug**: under the stated W4 method (Linear-only
-> Int4WeightOnly) ResNet50 measures ≈90 MB, because most of its weights are in Conv2d layers that
-> this method leaves in FP. Table III's 91.02 MB (ImageNet) is the correct figure.
+> ResNet50 is a CNN: Linear-only W4 quantizes only its `nn.Linear` layers and leaves the Conv2d
+> backbone in FP. So W4 compresses the 1000-class ImageNet model modestly (97.79 → 91.0 MB, the big
+> classifier head) and the 7-class PACS model negligibly (90.03 → 90.0 MB). The DeiT models, being
+> Linear-heavy, compress far more.
