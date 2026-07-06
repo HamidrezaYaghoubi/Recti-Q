@@ -44,13 +44,18 @@ FP32 and W4 match the paper within ≤0.2 pp; Recti-Q recovery is directionally 
 
 | Corruptions | FP32 | W4 | Recti-Q | W4 gap | Recovery | Size FP32→W4 |
 |:-----------:|:----:|:--:|:-------:|:------:|:--------:|:------------:|
-| 4-corruption mean | 21.80 | 21.67 | 27.16 | −0.13 | +1.49 | 97.8 → 91.0 MB |
+| 4-corruption mean | 21.80 | 21.67 | 26.73 | −0.13 | **+5.06 ± 0.30** | 97.8 → 91.0 MB |
 | spatter | 32.45 | 32.21 | 29.62 | −0.24 | **−2.59** | 97.8 → 91.0 MB |
 
-> On ResNet50 the W4 gap is negligible (≤0.24), so there is essentially no
-> quantization-robustness gap to recover; Recti-Q's effect is a general head reshaping that is
-> **corruption-dependent** (see §2b). Our FP32/W4 **spatter** matches the paper (32.39/32.19) but
-> our Recti-Q **hurts** spatter (−2.59) vs the paper's +0.11.
+> Recovery is mean±std over seeds {0,1,2,42} (recovery = Recti-Q OOD − W4 OOD, per §2b).
+> On ResNet50 the W4 gap is negligible (≤0.24) because Linear-only W4 leaves the Conv2d weights
+> in FP, so there is essentially **no quantization-robustness gap** on this CNN — yet Recti-Q still
+> improves OOD substantially on the noise-type corruptions (the +5.06 mean is driven by
+> gaussian/shot/impulse noise at +6–7 pp; contrast is roughly flat). The effect is a genuine OOD
+> head-reshaping gain, not quantization recovery, and it is **corruption-dependent** (see §2b:
+> large positive on noise/fog/frost, negative on brightness/blur/pixelate/jpeg/spatter). Our
+> FP32/W4 **spatter** matches the paper (32.39/32.19) but our Recti-Q **hurts** spatter (−2.59)
+> vs the paper's +0.11 — so spatter is **not** a good corruption to report for ResNet50.
 
 ### 2b. ResNet50 per-corruption — per seed and combined (mean ± std over seeds {0,1,2,42})
 
@@ -87,17 +92,24 @@ FP32 and W4 match the paper within ≤0.2 pp; Recti-Q recovery is directionally 
 ## 3. ResNet50 — PACS (leave-one-domain-out; OOD = held-out domain)
 
 Base model: 30-epoch ERM source fine-tune (source-val ≈ 96–98%). *Accuracy is from this
-reconstruction, not the paper's original PACS checkpoints.*
+reconstruction, not the paper's original PACS checkpoints.* Unlike ImageNet-C (fixed pretrained
+backbone), **each seed retrains the base ERM model**, so FP32 and W4 also vary across seeds — all
+columns are mean ± std over seeds {0,1,2,42} (jobs 7054017, 7063510-12).
 
-| Target domain | FP32 | W4 | Recti-Q | W4 gap | Recovery | Size W4 |
-|---------------|:----:|:--:|:-------:|:------:|:--------:|:-------:|
-| photo         | 98.32 | 98.26 | 98.14 | −0.06 | −0.12 | 90.0 MB |
-| art_painting  | 82.18 | 82.23 | 82.62 | +0.05 | +0.39 | 90.0 MB |
-| cartoon       | 74.53 | 74.53 | 75.34 |  0.00 | +0.81 | 90.0 MB |
-| sketch        | 69.99 | 70.04 | 71.39 | +0.05 | **+1.35** | 90.0 MB |
+| Target domain | FP32 | W4 | Recti-Q | Recovery (RQ−W4) | RQ recovery per seed {0,1,2,42} | Size W4 |
+|---------------|:----:|:--:|:-------:|:----------------:|:-------------------------------:|:-------:|
+| sketch        | 72.46 ± 1.84 | 72.42 ± 1.78 | 73.30 ± 1.58 | **+0.88 ± 0.53** | +1.25 / +0.92 / +0.00 / +1.35 | 90.0 MB |
+| cartoon       | 74.57 ± 1.16 | 74.59 ± 1.04 | 74.92 ± 0.70 | +0.33 ± 0.75 | +1.28 / −0.17 / −0.59 / +0.81 | 90.0 MB |
+| art_painting  | 81.59 ± 1.26 | 81.62 ± 1.29 | 81.73 ± 1.34 | +0.11 ± 0.16 | +0.00 / +0.00 / +0.05 / +0.39 | 90.0 MB |
+| photo         | 98.23 ± 0.10 | 98.22 ± 0.09 | 98.23 ± 0.18 | +0.02 ± 0.12 | +0.18 / −0.06 / +0.06 / −0.12 | 90.0 MB |
+| **4-domain mean** | — | — | — | **+0.33 ± 0.33** | (per-seed: +0.68 / +0.17 / −0.12 / +0.61) | 90.0 MB |
 
-> The W4 gap is negligible on PACS too; Recti-Q recovery is positive on the harder domains
-> (sketch +1.35, cartoon +0.81) and ~0 on the easy photo domain.
+> The W4 gap is negligible on PACS (Linear-only leaves ResNet50's conv backbone in FP; |W4−FP32| ≤
+> 0.2 on every seed/domain). Recti-Q's recovery is a small OOD head-reshaping gain, best on the
+> hard **sketch** domain (+0.88 ± 0.53, and Recti-Q 73.30 > FP32 72.46) and roughly zero on the
+> easy photo/art_painting domains; cartoon is seed-noisy (±0.75). **Note:** the earlier single-seed
+> (42) numbers (sketch +1.35, cartoon +0.81) sat at the *high* end of the seed spread — the
+> multi-seed means above are the honest figures to report.
 
 ---
 

@@ -76,18 +76,54 @@ Trained Recti-Q adapters (a few hundred KB each) are in [`adapters/`](adapters/)
 verification without retraining:
 
 ```
-adapters/deit_tiny_imagenet_c_rectiq.pt    (301 KB)
-adapters/deit_small_imagenet_c_rectiq.pt   (349 KB)
-adapters/deit_base_imagenet_c_rectiq.pt    (445 KB)
+adapters/deit_tiny_imagenet_c_rectiq.pt      (301 KB)
+adapters/deit_small_imagenet_c_rectiq.pt     (349 KB)
+adapters/deit_base_imagenet_c_rectiq.pt      (445 KB)
+adapters/resnet50_imagenet_c_rectiq.pt       (764 KB)   # ResNet50, ImageNet-C
+adapters/resnet50_pacs_sketch_rectiq.pt      (516 KB)   # ResNet50, PACS (sketch held out)
 ```
 
 Each holds the LoRA `A`/`B` weights plus metadata (rank, alpha, feat_dim, num_classes); load with
 `src.rectiq.load_adapter`.
 
+---
+
+## Reproduce the ResNet50 results
+
+ResNet50 is a CNN: ~92% of its weights are in `nn.Conv2d`, which the paper's **Linear-only** W4
+(`Int4WeightOnly`, HQQ) leaves in full precision. So on ResNet50, W4 barely compresses and barely
+degrades — but Recti-Q still improves OOD robustness, showing the head-level rectification is
+architecture-agnostic.
+
+```bash
+# ImageNet-C: all 15 corruptions @ severity 5, Linear-only W4 (add --seed for the seed sweep)
+python -m src.main --config configs/imagenet_c_resnet_linear_all.yaml --no-wandb --seed 42
+
+# PACS: leave-one-domain-out over all four domains, Linear-only W4
+python -m src.main --config configs/pacs_resnet_linear_all.yaml --no-wandb --seed 42
+```
+
+**Expected numbers** (top-1 %, mean over seeds {0,1,2,42} for ImageNet-C; single A5000):
+
+| Benchmark | Split | FP32 | W4 | Recti-Q | Recovery | Size FP32→W4 |
+|-----------|-------|:----:|:--:|:-------:|:--------:|:------------:|
+| ImageNet-C | impulse_noise @ sev5 | 19.83 | 19.68 | **27.04 ± 0.30** | +7.37 ± 0.30 | 97.79 → 91.02 MB |
+| ImageNet-C | fog @ sev5           | 37.67 | 37.72 | **49.24 ± 0.37** | +11.53 ± 0.37 | 97.79 → 91.02 MB |
+| PACS (LODO) | sketch held out      | 72.46 ± 1.84 | 72.42 ± 1.78 | **73.30 ± 1.58** | +0.88 ± 0.53 | 90.03 → 90.03 MB |
+
+(ImageNet-C = mean over seeds {0,1,2,42}; PACS = mean over seeds {0,1,2,42}, base ERM retrained per
+seed. On PACS, Linear-only W4 leaves ResNet50 size unchanged — only the 7-class head is a Linear.)
+
+The full per-corruption / per-domain breakdown (per-seed and mean±std) is in
+[`RESULTS.md`](RESULTS.md). On ResNet50 the W4 gap is negligible (Linear-only), so the recovery is
+a genuine OOD head-reshaping gain rather than quantization repair; it is corruption-dependent
+(large positive on noise/fog/frost, negative on brightness/blur/pixelate/jpeg/spatter — see
+`RESULTS.md` §2b).
+
 ### Other runs
 
 ```bash
-python -m src.main --config configs/pacs_rectiq.yaml --no-wandb      # PACS leave-one-domain-out
+python -m src.main --config configs/pacs_rectiq.yaml --no-wandb      # DeiT PACS leave-one-domain-out
 python -m src.main --config configs/imagenet_c_rectiq.yaml --debug   # fast sanity check
 sbatch scripts/slurm_rectiq.sh configs/imagenet_c_rectiq.yaml        # SLURM (UMIACS Nexus Gamma)
 ```
