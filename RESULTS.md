@@ -17,22 +17,22 @@ compresses it less and degrades it less.
 | Model | ID FP32→W4 | OOD FP32 | OOD W4 | OOD Recti-Q | Recovery | Size FP32→W4 |
 |-------|:----------:|:--------:|:------:|:-----------:|:--------:|:------------:|
 | DeiT-tiny  | 72.16 → 71.54 | 18.00 | 17.33 | 17.59 | +0.26 | 21.9 → 16.3 MB |
-| DeiT-small | 79.85 → 78.94 | 33.92 | 29.39 | 29.52 | +0.13 | 84.2 → 26.2 MB |
+| DeiT-small | 79.85 → 78.94 | 33.96 | 29.49 | 30.42 | +0.94 | 84.2 → 26.2 MB |
 | DeiT-base  | 81.98 → 81.50 | 45.38 | 44.10 | 45.09 | +0.99 | 330.3 → 56.5 MB |
 
-> W4 preserves ID (≤0.6 pp drop) but opens the OOD gap; Recti-Q recovers a small, positive slice on
+> W4 preserves ID (≤0.91 pp drop) but opens the OOD gap; Recti-Q recovers a positive slice on
 > every DeiT model. Per-corruption detail in §1a.
 
 ### 1a. DeiT-small per-corruption (ImageNet-C @ sev5)
 
 | Corruption | FP32 | W4 | Recti-Q | W4 gap | Recovery |
 |------------|:----:|:--:|:-------:|:------:|:--------:|
-| contrast       | 39.45 | 33.67 | 34.00 | −5.78 | +0.33 |
-| gaussian_noise | 33.10 | 28.84 | 28.95 | −4.26 | +0.11 |
-| impulse_noise  | 32.80 | 28.64 | 28.68 | −4.16 | +0.04 |
-| shot_noise     | 30.32 | 26.39 | 26.44 | −3.93 | +0.05 |
+| contrast       | 39.46 | 33.84 | 36.52 | −5.62 | +2.68 |
+| gaussian_noise | 33.18 | 28.88 | 29.30 | −4.30 | +0.42 |
+| impulse_noise  | 32.82 | 28.92 | 29.19 | −3.90 | +0.27 |
+| shot_noise     | 30.36 | 26.30 | 26.67 | −4.06 | +0.37 |
 
-W4 opens a large gap on contrast/noise; Recti-Q gives a small positive recovery on each.
+W4 opens a large gap on contrast/noise; Recti-Q gives positive recovery on each.
 
 ---
 
