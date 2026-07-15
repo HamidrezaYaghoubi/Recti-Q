@@ -146,12 +146,4 @@ adapters/                      # pre-trained Recti-Q adapters
 
 ## Citation
 
-```bibtex
-@inproceedings{rectiq2026,
-  title     = {Recti-Q: Feature-Space Rectification for Out-of-Distribution-Robust
-               Quantized Perception in Edge Robotics},
-  author    = {Yaghoubi, Hamidreza and others},
-  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
-  year      = {2026}
-}
-```
+To be announced.
