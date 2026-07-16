@@ -1,3 +1,5 @@
+/* eslint-disable @next/next/no-img-element -- static GitHub Pages export uses project-relative assets */
+
 const results = [
   {
     value: "+7.37",
@@ -18,6 +20,8 @@ const results = [
     detail: "Rank 4 recovers 74% of the maximum gain",
   },
 ];
+
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 
 const pipeline = [
   {
@@ -66,9 +70,7 @@ export default function Home() {
           <a href="#results">Results</a>
           <a href="#deployment">Deployment</a>
         </nav>
-        <a className="header-link" href="/recti-q-paper.pdf" target="_blank">
-          Read paper <ArrowIcon />
-        </a>
+        <span className="header-link paper-soon">Paper · Coming soon</span>
       </header>
 
       <section className="hero" id="top">
@@ -88,9 +90,9 @@ export default function Home() {
             frozen backbone.
           </p>
           <div className="hero-actions">
-            <a className="button button-primary" href="/recti-q-paper.pdf" target="_blank">
-              Read the paper <ArrowIcon />
-            </a>
+            <span className="button button-primary button-disabled">
+              Paper coming soon
+            </span>
             <a
               className="button button-secondary"
               href="https://github.com/HamidrezaYaghoubi/Recti-Q"
@@ -191,7 +193,7 @@ export default function Home() {
 
         <div className="method-figure">
           <img
-            src="/assets/recti-q-method.png"
+            src={`${basePath}/assets/recti-q-method.png`}
             alt="Recti-Q training and inference pipeline with frozen teacher and quantized student, and a trainable LoRA adapter"
           />
           <p>
@@ -262,7 +264,7 @@ export default function Home() {
               </div>
             </div>
             <div className="result-figure">
-              <img src="/assets/imagenet-c-results.png" alt="ImageNet-C accuracy by corruption and severity for DeiT-S, comparing FP32, W4, and Recti-Q" />
+              <img src={`${basePath}/assets/imagenet-c-results.png`} alt="ImageNet-C accuracy by corruption and severity for DeiT-S, comparing FP32, W4, and Recti-Q" />
               <p>Recti-Q consistently improves over the W4 baseline across the tested ImageNet-C corruptions.</p>
             </div>
           </div>
@@ -294,7 +296,7 @@ export default function Home() {
           </p>
         </div>
         <div className="citation-actions">
-          <a className="button button-primary" href="/recti-q-paper.pdf" target="_blank">Download PDF <ArrowIcon /></a>
+          <span className="button button-primary button-disabled">Paper coming soon</span>
           <a className="text-link" href="https://github.com/HamidrezaYaghoubi/Recti-Q" target="_blank" rel="noreferrer">Code &amp; pretrained adapters <ArrowIcon /></a>
         </div>
       </section>

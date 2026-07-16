@@ -17,4 +17,10 @@ Open [http://localhost:3000](http://localhost:3000).
 npm run build
 ```
 
-The site is implemented with Next.js, React, and vinext. Paper-specific assets live in `public/`.
+The site is implemented with Next.js and React and exports to `out/` for GitHub Pages.
+
+The public project page is:
+
+<https://hamidrezayaghoubi.github.io/Recti-Q/>
+
+The paper link is intentionally marked **Coming soon** until the arXiv URL is available.
