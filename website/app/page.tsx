@@ -70,7 +70,14 @@ export default function Home() {
           <a href="#results">Results</a>
           <a href="#deployment">Deployment</a>
         </nav>
-        <span className="header-link paper-soon">Paper · Coming soon</span>
+        <a
+          className="header-link"
+          href="https://arxiv.org/abs/2607.18540"
+          target="_blank"
+          rel="noreferrer"
+        >
+          Paper <ArrowIcon />
+        </a>
       </header>
 
       <section className="hero" id="top">
@@ -90,9 +97,14 @@ export default function Home() {
             frozen backbone.
           </p>
           <div className="hero-actions">
-            <span className="button button-primary button-disabled">
-              Paper coming soon
-            </span>
+            <a
+              className="button button-primary"
+              href="https://arxiv.org/abs/2607.18540"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Read the paper <ArrowIcon />
+            </a>
             <a
               className="button button-secondary"
               href="https://github.com/HamidrezaYaghoubi/Recti-Q"
@@ -296,7 +308,14 @@ export default function Home() {
           </p>
         </div>
         <div className="citation-actions">
-          <span className="button button-primary button-disabled">Paper coming soon</span>
+          <a
+            className="button button-primary"
+            href="https://arxiv.org/abs/2607.18540"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Read on arXiv <ArrowIcon />
+          </a>
           <a className="text-link" href="https://github.com/HamidrezaYaghoubi/Recti-Q" target="_blank" rel="noreferrer">Code &amp; pretrained adapters <ArrowIcon /></a>
         </div>
       </section>

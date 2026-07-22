@@ -9,7 +9,8 @@ test("exports the Recti-Q project page", async () => {
 
   assert.match(html, /Recti-Q/);
   assert.match(html, /Robust 4-bit perception/);
-  assert.match(html, /Paper coming soon/i);
+  assert.match(html, /href="https:\/\/arxiv\.org\/abs\/2607\.18540"/i);
+  assert.doesNotMatch(html, /coming soon/i);
   assert.doesNotMatch(html, /recti-q-paper\.pdf/i);
   assert.doesNotMatch(html, /chatgpt\.site/i);
 });
