@@ -23,4 +23,4 @@ The public project page is:
 
 <https://hamidrezayaghoubi.github.io/Recti-Q/>
 
-The paper link is intentionally marked **Coming soon** until the arXiv URL is available.
+The paper is available on [arXiv](https://arxiv.org/abs/2607.18540).

@@ -61,7 +61,6 @@ nav a { color: #44515b; }
 nav a:hover, .text-link:hover { color: var(--coral); }
 .header-link { justify-self: end; }
 .header-link span, .text-link span { color: var(--coral); padding-left: 5px; }
-.paper-soon { color: var(--muted); cursor: default; letter-spacing: 0.02em; }
 
 .hero {
   background: var(--ivory);
@@ -108,8 +107,6 @@ h1 span { color: var(--coral); display: block; }
 .button-secondary { background: transparent; }
 .button-secondary:hover { background: white; }
 .button span { font-size: 17px; }
-.button-disabled { cursor: default; opacity: 0.68; }
-.button-disabled:hover { background: var(--navy); border-color: var(--navy); color: white; transform: none; }
 
 .authors { border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px 24px; max-width: 700px; padding-top: 23px; }
 .authors p { font-size: 13px; font-weight: 730; margin-bottom: 0; }
